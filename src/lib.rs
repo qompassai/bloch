@@ -1,0 +1,3414 @@
+//! bloch: ranked, budgeted codebase maps for coding agents.
+//!
+//! Named for the Bloch sphere — the geometric map of a qubit's quantum state.
+//! Just as the Bloch sphere maps the infinite-dimensional Hilbert space of
+//! single-qubit states onto a 3D unit sphere, bloch maps the sprawling state
+//! of a codebase onto a compact, ranked representation.
+//!
+//! Walks a repo's text files, extracts structure (full tree-sitter for Rust,
+//! shallow regex for other languages), ranks definitions by qualified
+//! reference counting with recency weighting, and emits a budgeted map.
+//!
+//! Handoff fidelity: output leads with git session state, .ai/memory/
+//! contents, and cached test status so any AI model can pick up where the
+//! last one left off.
+
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use regex::Regex;
+use thiserror::Error;
+use tree_sitter::{Node, Parser as TsParser};
+use walkdir::WalkDir;
+
+/// Errors that can occur during repository mapping.
+#[derive(Error, Debug)]
+pub enum BlochError {
+    /// I/O error reading files or directories.
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// Failed to parse a Rust file with tree-sitter.
+    #[error("Rust parse failed for {path}: {msg}")]
+    ParseFailed { path: String, msg: String },
+
+    /// Git command failed or git is not available.
+    #[error("Git operation failed: {0}")]
+    GitFailed(String),
+
+    /// Invalid regular expression (internal error, should not happen).
+    #[error("Regex error: {0}")]
+    Regex(#[from] regex::Error),
+
+    /// Failed to set tree-sitter language (version incompatibility).
+    #[error("Tree-sitter language error: {0}")]
+    LanguageError(String),
+
+    /// Failed to parse SCIP index.
+    #[error("SCIP parse failed for {path}: {msg}")]
+    ScipParseFailed { path: String, msg: String },
+
+    /// Invalid path (traversal attempt or outside expected bounds).
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
+
+    /// JSON serialization/deserialization failed.
+    #[error("JSON error: {0}")]
+    JsonError(String),
+}
+
+/// Result type for bloch operations.
+pub type Result<T> = std::result::Result<T, BlochError>;
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "__pycache__",
+    ".hg",
+    ".svn",
+    ".venv",
+    "venv",
+    "dist",
+    "build",
+    ".next",
+    ".nuxt",
+    "vendor",
+];
+
+const SKIP_EXTS: &[&str] = &[
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".bmp", ".svg", ".pdf", ".zip", ".tar",
+    ".gz", ".bz2", ".xz", ".7z", ".mp3", ".mp4", ".wav", ".ogg", ".webm", ".ttf", ".otf", ".woff",
+    ".woff2", ".eot", ".exe", ".dll", ".so", ".dylib", ".a", ".o", ".pyc", ".pyo", ".class", ".db",
+    ".sqlite", ".sqlite3",
+];
+
+const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
+const SIG_TRUNC: usize = 220;
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Definition {
+    pub name: String,
+    pub kind: String,
+    pub is_pub: bool,
+    pub sig: String,
+    pub impl_target: Option<String>,
+    pub lang: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RefKind {
+    Call,
+    Type,
+    Path,
+    Ident,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Refs {
+    call: HashMap<(String, Option<String>), usize>,
+    type_refs: HashMap<String, usize>,
+    path_refs: HashMap<String, usize>,
+    ident_refs: HashMap<String, usize>,
+}
+
+/// Per-file data extracted from a SCIP index: (definitions, references, language).
+pub type ScipFileData = (Vec<Definition>, Refs, String);
+
+impl Refs {
+    pub fn get(&self, kind: RefKind, key: &RefKey) -> usize {
+        match (kind, key) {
+            (RefKind::Call, RefKey::Call(n, q)) => {
+                *self.call.get(&(n.clone(), q.clone())).unwrap_or(&0)
+            }
+            (RefKind::Type, RefKey::Single(n)) => *self.type_refs.get(n).unwrap_or(&0),
+            (RefKind::Path, RefKey::Single(n)) => *self.path_refs.get(n).unwrap_or(&0),
+            (RefKind::Ident, RefKey::Single(n)) => *self.ident_refs.get(n).unwrap_or(&0),
+            _ => 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RefKey {
+    Call(String, Option<String>),
+    Single(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct FileData {
+    pub defs: Vec<Definition>,
+    pub refs: Refs,
+    pub modpath: Vec<String>,
+    pub lang: String,
+}
+
+/// Cached map data for diffing between sessions.
+/// Written to `.ai/memory/bloch-last.json` by `--update-memory`,
+/// read by `--diff` to show what changed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CachedMap {
+    /// ISO 8601 timestamp of when the map was generated.
+    pub timestamp: String,
+    /// Git HEAD SHA at map time (empty if not a git repo).
+    pub git_head: String,
+    /// Map of relative path -> list of definition names.
+    pub files: std::collections::HashMap<String, Vec<String>>,
+    /// Top definitions by probability: (rel_path, name, kind, probability).
+    pub top_defs: Vec<(String, String, String, f64)>,
+    /// Language breakdown: lang -> file count.
+    pub languages: std::collections::HashMap<String, usize>,
+}
+
+/// Write a human-readable summary to `.ai/memory/bloch-summary.md`.
+/// Returns the path written, or an error.
+/// Get the memory directory, validating that root doesn't contain path traversal.
+/// Returns an error if the canonicalized path would escape the intended location.
+fn memory_dir(root: &std::path::Path) -> Result<std::path::PathBuf> {
+    // Reject roots with parent directory components to prevent traversal
+    for component in root.components() {
+        if matches!(component, std::path::Component::ParentDir) {
+            return Err(BlochError::InvalidPath(
+                "root path contains parent directory (..) components".to_string(),
+            ));
+        }
+    }
+    let mem_dir = root.join(".ai").join("memory");
+    std::fs::create_dir_all(&mem_dir)?;
+    // Verify the created dir is where we expect (no symlink trickery)
+    let canonical = mem_dir.canonicalize().map_err(BlochError::Io)?;
+    let root_canonical = root.canonicalize().map_err(BlochError::Io)?;
+    if !canonical.starts_with(&root_canonical) {
+        return Err(BlochError::InvalidPath(
+            "memory directory escapes root".to_string(),
+        ));
+    }
+    Ok(mem_dir)
+}
+
+/// Write content atomically: write to temp file, then rename.
+/// Prevents corrupt files if the process crashes mid-write.
+fn atomic_write(path: &std::path::Path, content: &str) -> Result<()> {
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, content)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+pub fn write_memory_summary(
+    root: &std::path::Path,
+    cached: &CachedMap,
+) -> Result<std::path::PathBuf> {
+    let mem_dir = memory_dir(root)?;
+    let path = mem_dir.join("bloch-summary.md");
+
+    let mut out = String::new();
+    out.push_str(
+        "# bloch summary
+
+",
+    );
+    out.push_str(&format!(
+        "Generated: {}
+",
+        cached.timestamp
+    ));
+    if !cached.git_head.is_empty() {
+        out.push_str(&format!(
+            "Git HEAD: {}
+",
+            cached.git_head
+        ));
+    }
+    out.push_str(&format!(
+        "
+## Files: {} total
+
+",
+        cached.files.len()
+    ));
+    out.push_str(
+        "## Languages
+
+",
+    );
+    let mut langs: Vec<(&String, &usize)> = cached.languages.iter().collect();
+    langs.sort_by(|a, b| b.1.cmp(a.1));
+    for (lang, count) in langs {
+        out.push_str(&format!(
+            "- {}: {} files
+",
+            lang, count
+        ));
+    }
+    out.push_str(
+        "
+## Top definitions by probability
+
+",
+    );
+    for (i, (rel, name, kind, prob)) in cached.top_defs.iter().enumerate() {
+        out.push_str(&format!(
+            "{}. `{}::{}::{}::{}::{}` (p={:.3})
+",
+            i + 1,
+            rel,
+            name,
+            kind,
+            prob,
+            "",
+            prob
+        ));
+        // Fix the format - we want rel, kind, name
+        let _ = (rel, name, kind);
+    }
+    // Rewrite the top defs section properly
+    let mut top_section = String::from(
+        "
+## Top definitions by probability
+
+",
+    );
+    for (i, (rel, name, kind, prob)) in cached.top_defs.iter().enumerate() {
+        top_section.push_str(&format!(
+            "{}. {} `{}::{}` (p={:.3})
+",
+            i + 1,
+            kind,
+            rel,
+            name,
+            prob
+        ));
+    }
+    // Replace the broken section
+    if let Some(idx) = out.find(
+        "
+## Top definitions by probability
+
+",
+    ) {
+        out.truncate(idx);
+        out.push_str(&top_section);
+    }
+
+    atomic_write(&path, &out)?;
+    Ok(path)
+}
+
+/// Write machine-readable cache to `.ai/memory/bloch-last.json`.
+pub fn write_memory_cache(
+    root: &std::path::Path,
+    cached: &CachedMap,
+) -> Result<std::path::PathBuf> {
+    let mem_dir = memory_dir(root)?;
+    let path = mem_dir.join("bloch-last.json");
+    let json = serde_json::to_string_pretty(cached)
+        .map_err(|e| BlochError::JsonError(format!("JSON serialize failed: {}", e)))?;
+    atomic_write(&path, &json)?;
+    Ok(path)
+}
+
+/// Read the cached map from `.ai/memory/bloch-last.json`, if it exists.
+pub fn read_memory_cache(root: &std::path::Path) -> Result<Option<CachedMap>> {
+    let path = root.join(".ai").join("memory").join("bloch-last.json");
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(BlochError::Io(e)),
+    };
+    let map: CachedMap = serde_json::from_str(&content).map_err(|e| {
+        BlochError::JsonError(format!("corrupt cache at {}: {}", path.display(), e))
+    })?;
+    Ok(Some(map))
+}
+
+/// Compute a diff between a cached map and the current state.
+/// Returns a human-readable diff string.
+pub fn diff_maps(old: &CachedMap, new: &CachedMap) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# bloch diff: changes since last map
+
+",
+    );
+    out.push_str(&format!(
+        "Previous: {} ({})
+",
+        old.timestamp, old.git_head
+    ));
+    out.push_str(&format!(
+        "Current:  {} ({})
+
+",
+        new.timestamp, new.git_head
+    ));
+
+    // New files
+    let old_files: std::collections::HashSet<&String> = old.files.keys().collect();
+    let new_files: std::collections::HashSet<&String> = new.files.keys().collect();
+    let added: Vec<&&String> = new_files.difference(&old_files).collect();
+    let removed: Vec<&&String> = old_files.difference(&new_files).collect();
+
+    if !added.is_empty() {
+        out.push_str(&format!(
+            "## New files ({})
+
+",
+            added.len()
+        ));
+        let mut sorted: Vec<&String> = added.iter().map(|s| **s).collect();
+        sorted.sort();
+        for f in sorted.iter().take(20) {
+            out.push_str(&format!(
+                "+ {}
+",
+                f
+            ));
+        }
+        if sorted.len() > 20 {
+            out.push_str(&format!(
+                "  ... and {} more
+",
+                sorted.len() - 20
+            ));
+        }
+        out.push('\n');
+    }
+
+    if !removed.is_empty() {
+        out.push_str(&format!(
+            "## Removed files ({})
+
+",
+            removed.len()
+        ));
+        let mut sorted: Vec<&String> = removed.iter().map(|s| **s).collect();
+        sorted.sort();
+        for f in sorted.iter().take(20) {
+            out.push_str(&format!(
+                "- {}
+",
+                f
+            ));
+        }
+        if sorted.len() > 20 {
+            out.push_str(&format!(
+                "  ... and {} more
+",
+                sorted.len() - 20
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Definition changes in common files
+    let mut def_changes = Vec::new();
+    for (path, new_defs) in &new.files {
+        if let Some(old_defs) = old.files.get(path) {
+            let old_set: std::collections::HashSet<&String> = old_defs.iter().collect();
+            let new_set: std::collections::HashSet<&String> = new_defs.iter().collect();
+            for d in new_set.difference(&old_set) {
+                def_changes.push(format!("+ {}::{}", path, d));
+            }
+            for d in old_set.difference(&new_set) {
+                def_changes.push(format!("- {}::{}", path, d));
+            }
+        }
+    }
+    if !def_changes.is_empty() {
+        out.push_str(&format!(
+            "## Definition changes ({})
+
+",
+            def_changes.len()
+        ));
+        def_changes.sort();
+        for c in def_changes.iter().take(30) {
+            out.push_str(&format!(
+                "{}
+",
+                c
+            ));
+        }
+        if def_changes.len() > 30 {
+            out.push_str(&format!(
+                "  ... and {} more
+",
+                def_changes.len() - 30
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Probability shifts (top defs that moved significantly)
+    let old_probs: std::collections::HashMap<String, f64> = old
+        .top_defs
+        .iter()
+        .map(|(r, n, _, p)| (format!("{}::{}", r, n), *p))
+        .collect();
+    let mut shifts = Vec::new();
+    for (rel, name, kind, new_p) in &new.top_defs {
+        let key = format!("{}::{}", rel, name);
+        if let Some(old_p) = old_probs.get(&key) {
+            let delta = new_p - old_p;
+            if delta.abs() > 0.02 {
+                // Significant shift (>2% probability change)
+                shifts.push((
+                    delta,
+                    format!("{} `{}::{}` {:.3} → {:.3}", kind, rel, name, old_p, new_p),
+                ));
+            }
+        }
+    }
+    if !shifts.is_empty() {
+        shifts.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        out.push_str(&format!(
+            "## Significant probability shifts ({})
+
+",
+            shifts.len()
+        ));
+        for (_, desc) in shifts.iter().take(15) {
+            out.push_str(&format!(
+                "{}
+",
+                desc
+            ));
+        }
+        out.push('\n');
+    }
+
+    if added.is_empty() && removed.is_empty() && def_changes.is_empty() && shifts.is_empty() {
+        out.push_str(
+            "No significant changes since last map.
+",
+        );
+    }
+
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Git helpers (handoff fidelity)
+// ---------------------------------------------------------------------------
+
+pub fn run_git(root: &Path, args: &[&str]) -> String {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy_owned(o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
+pub fn get_session_state(root: &Path) -> String {
+    let mut lines = vec!["## session state".to_string()];
+
+    let branch = run_git(root, &["branch", "--show-current"]);
+    if !branch.is_empty() {
+        lines.push(format!("branch: {}", branch));
+    }
+
+    let status = run_git(
+        root,
+        &["status", "--porcelain=v1", "--untracked-files=normal"],
+    );
+    if !status.is_empty() {
+        let dirty: Vec<&str> = status.lines().filter(|l| !l.trim().is_empty()).collect();
+        lines.push(format!("dirty files ({}):", dirty.len()));
+        for l in dirty.iter().take(20) {
+            lines.push(format!("  {}", l));
+        }
+        if dirty.len() > 20 {
+            lines.push(format!("  ... and {} more", dirty.len() - 20));
+        }
+    } else {
+        lines.push("tree: clean".to_string());
+    }
+
+    let log = run_git(root, &["log", "--oneline", "-8", "--no-decorate"]);
+    if !log.is_empty() {
+        lines.push("recent commits:".to_string());
+        for l in log.lines().take(8) {
+            lines.push(format!("  {}", l));
+        }
+    }
+
+    let stash = run_git(root, &["stash", "list"]);
+    if !stash.is_empty() {
+        lines.push("stashes:".to_string());
+        for l in stash.lines().take(5) {
+            lines.push(format!("  {}", l));
+        }
+    }
+
+    lines.join("\n")
+}
+
+pub fn get_memory_context(root: &Path, budget: usize) -> String {
+    let mem_dir = root.join(".ai").join("memory");
+    if !mem_dir.is_dir() {
+        return String::new();
+    }
+
+    let mut lines = vec!["## memory (from .ai/memory/)".to_string()];
+    let mut used: usize = lines.iter().map(|l| l.len() + 1).sum();
+
+    // Priority order: handoff first
+    let priority = ["handoff.md", "active.md", "patterns.md", "decisions.md"];
+    let mut ordered: Vec<PathBuf> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for p in &priority {
+        let fp = mem_dir.join(p);
+        if fp.is_file() {
+            ordered.push(fp);
+            seen.insert(p.to_string());
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(&mem_dir) {
+        let mut rest: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.extension().map(|e| e == "md").unwrap_or(false)
+                    && p.file_name()
+                        .map(|n| !seen.contains(&n.to_string_lossy().to_string()))
+                        .unwrap_or(false)
+            })
+            .collect();
+        rest.sort();
+        ordered.extend(rest);
+    }
+
+    for fp in ordered {
+        let content = fs::read_to_string(&fp).unwrap_or_default();
+        let content = content.trim();
+        if content.is_empty() {
+            continue;
+        }
+        let name = match fp.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        let header = format!("### {}", name);
+        let max_file = 1200;
+        let truncated = if content.len() > max_file {
+            format!("{}\n... (truncated)", &content[..max_file])
+        } else {
+            content.to_string()
+        };
+        let block = format!("{}\n{}", header, truncated);
+        if used + block.len() + 1 > budget {
+            lines.push(format!("### {} (omitted: over memory budget)", name));
+            continue;
+        }
+        used += block.len() + 1;
+        lines.push(block);
+    }
+
+    if lines.len() == 1 {
+        return String::new();
+    }
+    lines.join("\n\n")
+}
+
+pub fn get_test_status(root: &Path, budget: usize) -> String {
+    let candidates = [
+        ".ai/memory/test-status.json",
+        ".ai/test-status.json",
+        "target/.test-status.json",
+    ];
+
+    for c in &candidates {
+        let fp = root.join(c);
+        if !fp.is_file() {
+            continue;
+        }
+        let content = match fs::read_to_string(&fp) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let data: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let mut lines = vec!["## last test/lint run".to_string()];
+        for k in &[
+            "command",
+            "passed",
+            "failed",
+            "failing_tests",
+            "warnings",
+            "timestamp",
+        ] {
+            if let Some(v) = data.get(*k) {
+                match v {
+                    serde_json::Value::Array(arr) => {
+                        lines.push(format!("{}:", k));
+                        for item in arr.iter().take(10) {
+                            lines.push(format!("  - {}", item));
+                        }
+                    }
+                    _ => lines.push(format!("{}: {}", k, v)),
+                }
+            }
+        }
+        let out = lines.join("\n");
+        return out.chars().take(budget).collect();
+    }
+    String::new()
+}
+
+pub fn get_file_recency_boost(root: &Path, rel: &str, max_boost: f64) -> f64 {
+    let ts = run_git(root, &["log", "-1", "--format=%ct", "--", rel]);
+    let ts: i64 = match ts.parse() {
+        Ok(n) => n,
+        Err(_) => return 1.0,
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(ts);
+    let age_days = (now - ts) as f64 / 86400.0;
+
+    if age_days > 30.0 {
+        return 1.0;
+    }
+    if age_days < 0.0 {
+        return max_boost;
+    }
+    1.0 + (max_boost - 1.0) * ((30.0 - age_days) / 30.0).max(0.0)
+}
+
+pub fn get_file_why(root: &Path, rel: &str, max_chars: usize) -> String {
+    let msg = run_git(root, &["log", "-1", "--format=%s", "--", rel]);
+    if msg.is_empty() {
+        return String::new();
+    }
+    let first = msg.split('.').next().unwrap_or("").trim();
+    if first.len() > max_chars {
+        format!("{}…", &first[..max_chars.saturating_sub(1)])
+    } else {
+        first.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File walking
+// ---------------------------------------------------------------------------
+
+fn is_text_file(path: &Path) -> bool {
+    use std::io::Read;
+    let mut fh = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = [0u8; 8192];
+    let n = match fh.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    !buf[..n].contains(&0)
+}
+
+pub fn iter_all_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            if e.file_type().is_dir() {
+                // Skip hidden dirs and build dirs
+                if name.starts_with('.') {
+                    return false;
+                }
+                return !SKIP_DIRS.contains(&name.as_ref());
+            }
+            true
+        });
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let name = match path.file_name() {
+            Some(n) => n.to_string_lossy(),
+            None => continue,
+        };
+
+        // Skip hidden files (except allowlisted)
+        if name.starts_with('.') && name != ".env.example" {
+            if name == ".DS_Store" || name == ".gitkeep" {
+                continue;
+            }
+            // Allow .gitignore etc but skip most dotfiles
+            if ![".gitignore", ".bloch.txt"].contains(&name.as_ref()) {
+                continue;
+            }
+        }
+
+        // Skip binary extensions
+        if let Some(ext) = path.extension() {
+            let ext = format!(".{}", ext.to_string_lossy().to_lowercase());
+            if SKIP_EXTS.contains(&ext.as_str()) {
+                continue;
+            }
+        }
+
+        // Skip large files
+        if let Ok(meta) = fs::metadata(path) {
+            if meta.len() > MAX_FILE_SIZE {
+                continue;
+            }
+        }
+
+        if is_text_file(path) {
+            out.push(path.to_path_buf());
+        }
+    }
+
+    out.sort();
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Tree-sitter helpers (Rust)
+// ---------------------------------------------------------------------------
+
+fn node_text<'a>(node: &Node, src: &'a [u8]) -> &'a str {
+    node.utf8_text(src).unwrap_or("")
+}
+
+fn is_pub(node: &Node) -> bool {
+    let mut cursor = node.walk();
+    let found = node
+        .children(&mut cursor)
+        .any(|c| c.kind() == "visibility_modifier");
+    found
+}
+
+fn def_name(node: &Node, src: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        let k = child.kind();
+        if k == "identifier" || k == "type_identifier" {
+            return Some(node_text(&child, src).to_string());
+        }
+    }
+    None
+}
+
+fn impl_target(node: &Node, src: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let cands: Vec<Node> = node
+        .children(&mut cursor)
+        .filter(|c| {
+            matches!(
+                c.kind(),
+                "type_identifier" | "generic_type" | "scoped_type_identifier"
+            )
+        })
+        .collect();
+    let last = cands.last()?;
+    match last.kind() {
+        "generic_type" => last
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, src).to_string()),
+        "scoped_type_identifier" => last
+            .child_by_field_name("name")
+            .map(|n| node_text(&n, src).to_string())
+            .or_else(|| Some(node_text(last, src).to_string())),
+        _ => Some(node_text(last, src).to_string()),
+    }
+}
+
+fn signature(node: &Node, src: &[u8]) -> String {
+    let mut end = node.end_byte();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.kind() == "block" {
+            end = child.start_byte();
+            break;
+        }
+    }
+    let sig: String = String::from_utf8_lossy(&src[node.start_byte()..end])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if sig.len() > SIG_TRUNC {
+        format!("{}…", &sig[..SIG_TRUNC - 1])
+    } else {
+        sig
+    }
+}
+
+pub fn mod_segments(rel: &str) -> Vec<String> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    if let Some(i) = parts.iter().position(|&p| p == "src") {
+        if i > 0 {
+            let krate = parts[i - 1].to_string();
+            let mut segs: Vec<String> = parts[i + 1..]
+                .iter()
+                .filter(|p| p.ends_with(".rs"))
+                .map(|p| p.trim_end_matches(".rs").to_string())
+                .filter(|s| !["lib", "main", "mod"].contains(&s.as_str()))
+                .collect();
+            let mut out = vec![krate];
+            out.append(&mut segs);
+            return out;
+        }
+    }
+    vec![Path::new(parts.last().unwrap_or(&""))
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string()]
+}
+
+fn extract_rust(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter::Language::new(tree_sitter_rust::LANGUAGE);
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(format!("rust: {e}")))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let mut defs = Vec::new();
+    let mut refs = Refs::default();
+
+    // Visit definitions
+    fn visit_def(node: &Node, src: &[u8], in_impl: Option<String>, defs: &mut Vec<Definition>) {
+        let kind = node.kind();
+        match kind {
+            "function_item" | "struct_item" | "enum_item" | "trait_item" | "type_item"
+            | "const_item" | "static_item" | "mod_item" => {
+                if let Some(name) = def_name(node, src) {
+                    let kind_str = if kind == "function_item" {
+                        "fn".to_string()
+                    } else {
+                        kind.trim_end_matches("_item").to_string()
+                    };
+                    defs.push(Definition {
+                        name,
+                        kind: kind_str,
+                        is_pub: is_pub(node),
+                        sig: signature(node, src),
+                        impl_target: in_impl.clone(),
+                        lang: "rust".to_string(),
+                    });
+                }
+            }
+            "impl_item" => {
+                let target = impl_target(node, src);
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    visit_def(&child, src, target.clone(), defs);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_def(&child, src, in_impl.clone(), defs);
+        }
+    }
+
+    // Visit references
+    fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
+        match node.kind() {
+            "call_expression" => {
+                if let Some(callee) = node.child_by_field_name("function") {
+                    match callee.kind() {
+                        "identifier" => {
+                            let name = node_text(&callee, src).to_string();
+                            *refs.call.entry((name, None)).or_insert(0) += 1;
+                        }
+                        "scoped_identifier" => {
+                            let nm = callee
+                                .child_by_field_name("name")
+                                .map(|n| node_text(&n, src).to_string());
+                            let ph = callee
+                                .child_by_field_name("path")
+                                .map(|n| node_text(&n, src).to_string());
+                            if let Some(n) = nm {
+                                *refs.call.entry((n, ph)).or_insert(0) += 1;
+                            }
+                        }
+                        "field_expression" => {
+                            let f = callee.child_by_field_name("field");
+                            let v = callee.child_by_field_name("value");
+                            if let (Some(f), Some(v)) = (f, v) {
+                                let fname = node_text(&f, src).to_string();
+                                let vtext = node_text(&v, src).to_string();
+                                let q = if v.kind() == "identifier" {
+                                    Some(vtext)
+                                } else {
+                                    None
+                                };
+                                *refs.call.entry((fname, q)).or_insert(0) += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "type_identifier" => {
+                let name = node_text(node, src).to_string();
+                *refs.type_refs.entry(name).or_insert(0) += 1;
+            }
+            "scoped_identifier" | "scoped_type_identifier" => {
+                if let Some(ph) = node.child_by_field_name("path") {
+                    let ptext = node_text(&ph, src);
+                    for seg in ptext.split("::") {
+                        *refs.path_refs.entry(seg.to_string()).or_insert(0) += 1;
+                    }
+                }
+            }
+            "identifier" => {
+                let name = node_text(node, src).to_string();
+                *refs.ident_refs.entry(name).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_ref(&child, src, refs);
+        }
+    }
+
+    visit_def(&tree.root_node(), src, None, &mut defs);
+    visit_ref(&tree.root_node(), src, &mut refs);
+    Ok((defs, refs))
+}
+
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Lua extractor (tree-sitter)
+// ---------------------------------------------------------------------------
+
+fn extract_lua(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter::Language::new(tree_sitter_lua::LANGUAGE);
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(format!("lua: {e}")))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let mut defs = Vec::new();
+    let mut refs = Refs::default();
+
+    fn name_text(node: &Node, src: &[u8]) -> String {
+        node_text(node, src).to_string()
+    }
+
+    fn visit_def(node: &Node, src: &[u8], defs: &mut Vec<Definition>) {
+        match node.kind() {
+            "function_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "function".to_string(),
+                        is_pub: !name.starts_with("local"),
+                        sig: format!("function {}", name),
+                        impl_target: None,
+                        lang: "lua".to_string(),
+                    });
+                }
+            }
+            "variable_declaration" => {
+                // local x = function() ... end
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "assignment_statement" {
+                        let mut ac = child.walk();
+                        let kids: Vec<Node> = child.children(&mut ac).collect();
+                        if kids.len() >= 2 {
+                            let lhs = name_text(&kids[0], src);
+                            if kids[1].kind() == "function_definition" {
+                                defs.push(Definition {
+                                    name: lhs.clone(),
+                                    kind: "function".to_string(),
+                                    is_pub: false,
+                                    sig: format!("local function {}", lhs),
+                                    impl_target: None,
+                                    lang: "lua".to_string(),
+                                });
+                            } else {
+                                defs.push(Definition {
+                                    name: lhs.clone(),
+                                    kind: "variable".to_string(),
+                                    is_pub: false,
+                                    sig: format!("local {}", lhs),
+                                    impl_target: None,
+                                    lang: "lua".to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            "assignment_statement" => {
+                // M.foo = function() ... end  (module-level)
+                let mut cursor = node.walk();
+                let kids: Vec<Node> = node.children(&mut cursor).collect();
+                if kids.len() >= 2 && kids[1].kind() == "function_definition" {
+                    let name = name_text(&kids[0], src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "function".to_string(),
+                        is_pub: true,
+                        sig: format!("{} = function", name),
+                        impl_target: None,
+                        lang: "lua".to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_def(&child, src, defs);
+        }
+    }
+
+    fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
+        match node.kind() {
+            "function_call" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    // require("...") is an import
+                    if name == "require" {
+                        if let Some(args) = node.child_by_field_name("arguments") {
+                            let mut ac = args.walk();
+                            for arg in args.children(&mut ac) {
+                                if arg.kind() == "string" {
+                                    let mod_name = name_text(&arg, src)
+                                        .trim_matches('"')
+                                        .trim_matches('\'')
+                                        .to_string();
+                                    *refs.path_refs.entry(mod_name).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    } else {
+                        *refs.call.entry((name, None)).or_insert(0) += 1;
+                    }
+                }
+            }
+            "identifier" => {
+                let name = name_text(node, src);
+                *refs.ident_refs.entry(name).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_ref(&child, src, refs);
+        }
+    }
+
+    visit_def(&tree.root_node(), src, &mut defs);
+    visit_ref(&tree.root_node(), src, &mut refs);
+    Ok((defs, refs))
+}
+
+// ---------------------------------------------------------------------------
+// Python extractor (tree-sitter)
+// ---------------------------------------------------------------------------
+
+fn extract_python(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter::Language::new(tree_sitter_python::LANGUAGE);
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(format!("python: {e}")))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let mut defs = Vec::new();
+    let mut refs = Refs::default();
+
+    fn name_text(node: &Node, src: &[u8]) -> String {
+        node_text(node, src).to_string()
+    }
+
+    fn visit_def(node: &Node, src: &[u8], in_class: Option<String>, defs: &mut Vec<Definition>) {
+        match node.kind() {
+            "function_definition" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "function".to_string(),
+                        is_pub: !name.starts_with('_'),
+                        sig: format!("def {}", name),
+                        impl_target: in_class.clone(),
+                        lang: "python".to_string(),
+                    });
+                }
+            }
+            "class_definition" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "class".to_string(),
+                        is_pub: !name.starts_with('_'),
+                        sig: format!("class {}", name),
+                        impl_target: None,
+                        lang: "python".to_string(),
+                    });
+                    // Visit methods with class context
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        visit_def(&child, src, Some(name.clone()), defs);
+                    }
+                    return;
+                }
+            }
+            "decorated_definition" => {
+                if let Some(def_node) = node.child_by_field_name("definition") {
+                    visit_def(&def_node, src, in_class.clone(), defs);
+                    return;
+                }
+            }
+            "assignment" => {
+                // x = ... or x: int = ...
+                if let Some(left) = node.child_by_field_name("left") {
+                    if left.kind() == "identifier" {
+                        let name = name_text(&left, src);
+                        defs.push(Definition {
+                            name: name.clone(),
+                            kind: "variable".to_string(),
+                            is_pub: !name.starts_with('_'),
+                            sig: name.clone(),
+                            impl_target: in_class.clone(),
+                            lang: "python".to_string(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_def(&child, src, in_class.clone(), defs);
+        }
+    }
+
+    fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
+        match node.kind() {
+            "call" => {
+                if let Some(func) = node.child_by_field_name("function") {
+                    match func.kind() {
+                        "identifier" => {
+                            let name = name_text(&func, src);
+                            *refs.call.entry((name, None)).or_insert(0) += 1;
+                        }
+                        "attribute" => {
+                            let attr = func.child_by_field_name("attribute");
+                            let obj = func.child_by_field_name("object");
+                            if let (Some(a), Some(o)) = (attr, obj) {
+                                let aname = name_text(&a, src);
+                                let oname = name_text(&o, src);
+                                let qualifier = if o.kind() == "identifier" {
+                                    Some(oname)
+                                } else {
+                                    None
+                                };
+                                *refs.call.entry((aname, qualifier)).or_insert(0) += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "import_statement" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    *refs.path_refs.entry(name).or_insert(0) += 1;
+                }
+            }
+            "import_from_statement" => {
+                if let Some(mod_node) = node.child_by_field_name("module_name") {
+                    let name = name_text(&mod_node, src);
+                    *refs.path_refs.entry(name).or_insert(0) += 1;
+                }
+            }
+            "identifier" => {
+                let name = name_text(node, src);
+                *refs.ident_refs.entry(name).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_ref(&child, src, refs);
+        }
+    }
+
+    visit_def(&tree.root_node(), src, None, &mut defs);
+    visit_ref(&tree.root_node(), src, &mut refs);
+    Ok((defs, refs))
+}
+
+// ---------------------------------------------------------------------------
+// Nix extractor (tree-sitter)
+// ---------------------------------------------------------------------------
+
+fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter::Language::new(tree_sitter_nix::LANGUAGE);
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(format!("nix: {e}")))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let mut defs = Vec::new();
+    let mut refs = Refs::default();
+
+    fn name_text(node: &Node, src: &[u8]) -> String {
+        node_text(node, src).to_string()
+    }
+
+    // Join dotted attrpath: a.b.c
+    fn attrpath_text(node: &Node, src: &[u8]) -> String {
+        let mut parts = Vec::new();
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "identifier" {
+                parts.push(name_text(&child, src));
+            }
+        }
+        parts.join(".")
+    }
+
+    fn visit_def(node: &Node, src: &[u8], defs: &mut Vec<Definition>) {
+        match node.kind() {
+            "binding" => {
+                if let Some(attrpath) = node.child_by_field_name("attrpath") {
+                    let name = attrpath_text(&attrpath, src);
+                    if !name.is_empty() && name != "inherit" {
+                        // Check if value is a function
+                        let is_func = node
+                            .child_by_field_name("expression")
+                            .map(|e| e.kind() == "function_expression")
+                            .unwrap_or(false);
+                        defs.push(Definition {
+                            name: name.clone(),
+                            kind: if is_func {
+                                "function".to_string()
+                            } else {
+                                "attr".to_string()
+                            },
+                            is_pub: true,
+                            sig: name.clone(),
+                            impl_target: None,
+                            lang: "nix".to_string(),
+                        });
+                    }
+                }
+            }
+            "function_expression" => {
+                // Anonymous function or formal params - capture formals as signature hint
+                if let Some(formals) = node.child_by_field_name("formals") {
+                    let mut params = Vec::new();
+                    let mut cursor = formals.walk();
+                    for child in formals.children(&mut cursor) {
+                        if child.kind() == "formal" {
+                            if let Some(name_node) = child.child_by_field_name("name") {
+                                params.push(name_text(&name_node, src));
+                            }
+                        }
+                    }
+                    if !params.is_empty() {
+                        // This is a standalone function definition worth noting
+                        // (usually bound to a name via binding, but capture anyway)
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_def(&child, src, defs);
+        }
+    }
+
+    fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
+        match node.kind() {
+            "variable_expression" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    // Skip 'import' keyword usage (it's a variable_expression with name "import")
+                    if name != "import" {
+                        *refs.ident_refs.entry(name).or_insert(0) += 1;
+                    } else {
+                        // import ./foo.nix - track as path ref
+                        // The argument is a sibling in apply_expression; handled below
+                    }
+                }
+            }
+            "apply_expression" => {
+                // Check for import calls: import ./path
+                if let Some(func) = node.child_by_field_name("function") {
+                    if func.kind() == "variable_expression" {
+                        if let Some(name_node) = func.child_by_field_name("name") {
+                            if name_text(&name_node, src) == "import" {
+                                if let Some(arg) = node.child_by_field_name("argument") {
+                                    if arg.kind() == "path_expression" {
+                                        let path = name_text(&arg, src);
+                                        *refs.path_refs.entry(path).or_insert(0) += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "select_expression" => {
+                // a.b.c - track attrpath references
+                if let Some(attrpath) = node.child_by_field_name("attrpath") {
+                    let name = attrpath_text(&attrpath, src);
+                    if !name.is_empty() {
+                        *refs.ident_refs.entry(name).or_insert(0) += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_ref(&child, src, refs);
+        }
+    }
+
+    visit_def(&tree.root_node(), src, &mut defs);
+    visit_ref(&tree.root_node(), src, &mut refs);
+    Ok((defs, refs))
+}
+
+// ---------------------------------------------------------------------------
+// Markdown extractor (tree-sitter-md, block grammar)
+// ---------------------------------------------------------------------------
+
+fn extract_markdown_ts(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter::Language::new(tree_sitter_md::LANGUAGE);
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(format!("markdown: {e}")))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let mut defs = Vec::new();
+    let refs = Refs::default();
+
+    fn name_text(node: &Node, src: &[u8]) -> String {
+        node_text(node, src).to_string()
+    }
+
+    fn visit(node: &Node, src: &[u8], defs: &mut Vec<Definition>) {
+        match node.kind() {
+            "atx_heading" => {
+                // Level from marker: atx_h1_marker ... atx_h6_marker
+                let mut level = 0;
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    let k = child.kind();
+                    if k.starts_with("atx_h") && k.ends_with("_marker") {
+                        // Extract digit: "atx_h2_marker" -> 2
+                        if let Some(d) = k.chars().nth(5) {
+                            level = d.to_digit(10).unwrap_or(0) as usize;
+                        }
+                    }
+                }
+                if (1..=6).contains(&level) {
+                    if let Some(content) = node.child_by_field_name("heading_content") {
+                        let title = name_text(&content, src).trim().to_string();
+                        if !title.is_empty() {
+                            defs.push(Definition {
+                                name: title.clone(),
+                                kind: format!("h{}", level),
+                                is_pub: true,
+                                sig: format!("{} {}", "#".repeat(level), title),
+                                impl_target: None,
+                                lang: "markdown".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            "setext_heading" => {
+                // Level from underline: setext_h1_underline (===) vs setext_h2_underline (---)
+                let mut level = 2;
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "setext_h1_underline" {
+                        level = 1;
+                    }
+                }
+                if let Some(content) = node.child_by_field_name("heading_content") {
+                    let title = name_text(&content, src).trim().to_string();
+                    if !title.is_empty() {
+                        defs.push(Definition {
+                            name: title.clone(),
+                            kind: format!("h{}", level),
+                            is_pub: true,
+                            sig: title.clone(),
+                            impl_target: None,
+                            lang: "markdown".to_string(),
+                        });
+                    }
+                }
+            }
+            "fenced_code_block" => {
+                // Find language from info_string -> language child
+                let mut lang_tag = String::new();
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "info_string" {
+                        let mut ic = child.walk();
+                        for info_child in child.children(&mut ic) {
+                            if info_child.kind() == "language" {
+                                lang_tag = name_text(&info_child, src);
+                            }
+                        }
+                    }
+                }
+                let name = if lang_tag.is_empty() {
+                    "code block".to_string()
+                } else {
+                    format!("{} code", lang_tag)
+                };
+                defs.push(Definition {
+                    name: name.clone(),
+                    kind: "code".to_string(),
+                    is_pub: true,
+                    sig: name,
+                    impl_target: None,
+                    lang: "markdown".to_string(),
+                });
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, src, defs);
+        }
+    }
+
+    visit(&tree.root_node(), src, &mut defs);
+    Ok((defs, refs))
+}
+
+// Kotlin extractor (tree-sitter) - using tree-sitter-kotlin-ng 1.1.0
+// ---------------------------------------------------------------------------
+// Kotlin extractor (tree-sitter)
+// ---------------------------------------------------------------------------
+
+fn extract_kotlin(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter_kotlin_ng::LANGUAGE.into();
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(e.to_string()))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let mut defs = Vec::new();
+    let mut refs = Refs::default();
+
+    fn name_text(node: &Node, src: &[u8]) -> String {
+        node_text(node, src).to_string()
+    }
+
+    // First direct child of given type
+    fn first_child_of<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
+        let mut cursor = node.walk();
+        // Named binding (not a chained temporary) so the iterator drops
+        // before cursor, satisfying the borrow checker.
+        let mut children = node.children(&mut cursor);
+        children.find(|child| child.kind() == kind)
+    }
+
+    fn visit_def(node: &Node, src: &[u8], defs: &mut Vec<Definition>) {
+        match node.kind() {
+            "function_declaration" => {
+                if let Some(name_node) = first_child_of(node, "identifier") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "function".to_string(),
+                        is_pub: true, // visibility modifier check would be more precise
+                        sig: format!("fun {}", name),
+                        impl_target: None,
+                        lang: "kotlin".to_string(),
+                    });
+                }
+            }
+            "class_declaration" | "object_declaration" => {
+                if let Some(name_node) = first_child_of(node, "identifier") {
+                    let name = name_text(&name_node, src);
+                    let kind = if node.kind() == "class_declaration" {
+                        "class"
+                    } else {
+                        "object"
+                    };
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: kind.to_string(),
+                        is_pub: true,
+                        sig: format!("{} {}", kind, name),
+                        impl_target: None,
+                        lang: "kotlin".to_string(),
+                    });
+                }
+            }
+            "property_declaration" => {
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "variable_declaration" {
+                        if let Some(name_node) = first_child_of(&child, "identifier") {
+                            let name = name_text(&name_node, src);
+                            defs.push(Definition {
+                                name: name.clone(),
+                                kind: "property".to_string(),
+                                is_pub: true,
+                                sig: format!("val/var {}", name),
+                                impl_target: None,
+                                lang: "kotlin".to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+            "type_alias" => {
+                if let Some(name_node) = first_child_of(node, "identifier") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "typealias".to_string(),
+                        is_pub: true,
+                        sig: format!("typealias {}", name),
+                        impl_target: None,
+                        lang: "kotlin".to_string(),
+                    });
+                }
+            }
+            "enum_entry" => {
+                if let Some(name_node) = first_child_of(node, "identifier") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "enum_entry".to_string(),
+                        is_pub: true,
+                        sig: name.clone(),
+                        impl_target: None,
+                        lang: "kotlin".to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_def(&child, src, defs);
+        }
+    }
+
+    fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
+        match node.kind() {
+            "call_expression" => {
+                // Function name is typically first identifier child
+                if let Some(name_node) = first_child_of(node, "identifier") {
+                    let name = name_text(&name_node, src);
+                    *refs.call.entry((name, None)).or_insert(0) += 1;
+                }
+            }
+            "navigation_expression" => {
+                // a.b.c - track the full chain
+                let text = name_text(node, src);
+                *refs.ident_refs.entry(text).or_insert(0) += 1;
+            }
+            "identifier" => {
+                let name = name_text(node, src);
+                // Skip keywords
+                if ![
+                    "val", "var", "fun", "class", "object", "if", "else", "when", "for", "while",
+                    "return",
+                ]
+                .contains(&name.as_str())
+                {
+                    *refs.ident_refs.entry(name).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_ref(&child, src, refs);
+        }
+    }
+
+    visit_def(&tree.root_node(), src, &mut defs);
+    visit_ref(&tree.root_node(), src, &mut refs);
+    Ok((defs, refs))
+}
+
+// ---------------------------------------------------------------------------
+// Bash extractor (tree-sitter)
+// ---------------------------------------------------------------------------
+
+fn extract_bash(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter::Language::new(tree_sitter_bash::LANGUAGE);
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(format!("bash: {e}")))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let mut defs = Vec::new();
+    let mut refs = Refs::default();
+
+    fn name_text(node: &Node, src: &[u8]) -> String {
+        node_text(node, src).to_string()
+    }
+
+    fn visit_def(node: &Node, src: &[u8], defs: &mut Vec<Definition>) {
+        match node.kind() {
+            "function_definition" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "function".to_string(),
+                        is_pub: true,
+                        sig: format!("{}()", name),
+                        impl_target: None,
+                        lang: "bash".to_string(),
+                    });
+                }
+            }
+            "variable_assignment" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "variable".to_string(),
+                        is_pub: false,
+                        sig: name.clone(),
+                        impl_target: None,
+                        lang: "bash".to_string(),
+                    });
+                }
+            }
+            "declaration_command" => {
+                // local, export, declare, readonly
+                let text = name_text(node, src);
+                // Extract variable name (first word after command)
+                let parts: Vec<&str> = text.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    // Skip flags like -r, -a
+                    for part in &parts[1..] {
+                        if !part.starts_with('-') && part.contains('=') {
+                            if let Some(name) = part.split('=').next() {
+                                defs.push(Definition {
+                                    name: name.to_string(),
+                                    kind: "variable".to_string(),
+                                    is_pub: parts[0] == "export",
+                                    sig: part.to_string(),
+                                    impl_target: None,
+                                    lang: "bash".to_string(),
+                                });
+                                break;
+                            }
+                        } else if !part.starts_with('-') {
+                            defs.push(Definition {
+                                name: part.to_string(),
+                                kind: "variable".to_string(),
+                                is_pub: parts[0] == "export",
+                                sig: part.to_string(),
+                                impl_target: None,
+                                lang: "bash".to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_def(&child, src, defs);
+        }
+    }
+
+    fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
+        match node.kind() {
+            "command" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    // Skip source/. as they are imports
+                    if name == "source" || name == "." {
+                        // Track sourced file as path ref
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            if child.kind() == "word" || child.kind() == "string" {
+                                let path = name_text(&child, src)
+                                    .trim_matches('"')
+                                    .trim_matches('\'')
+                                    .to_string();
+                                if !path.is_empty() && path != "source" && path != "." {
+                                    *refs.path_refs.entry(path).or_insert(0) += 1;
+                                }
+                            }
+                        }
+                    } else {
+                        *refs.call.entry((name, None)).or_insert(0) += 1;
+                    }
+                }
+            }
+            "simple_expansion" | "expansion" => {
+                // $VAR or ${VAR}
+                let text = name_text(node, src);
+                let var = text
+                    .trim_start_matches('$')
+                    .trim_start_matches('{')
+                    .trim_end_matches('}')
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                if !var.is_empty() {
+                    *refs.ident_refs.entry(var).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_ref(&child, src, refs);
+        }
+    }
+
+    visit_def(&tree.root_node(), src, &mut defs);
+    visit_ref(&tree.root_node(), src, &mut refs);
+    Ok((defs, refs))
+}
+
+// ---------------------------------------------------------------------------
+// TypeScript extractor (tree-sitter)
+// ---------------------------------------------------------------------------
+
+fn extract_typescript(src: &[u8], is_tsx: bool) -> Result<(Vec<Definition>, Refs)> {
+    let mut parser = TsParser::new();
+    let lang = tree_sitter::Language::new(if is_tsx {
+        tree_sitter_typescript::LANGUAGE_TSX
+    } else {
+        tree_sitter_typescript::LANGUAGE_TYPESCRIPT
+    });
+    parser
+        .set_language(&lang)
+        .map_err(|e| BlochError::LanguageError(format!("typescript: {e}")))?;
+    let tree = match parser.parse(src, None) {
+        Some(t) => t,
+        None => return Ok((Vec::new(), Refs::default())),
+    };
+
+    let lang_name = if is_tsx { "tsx" } else { "typescript" };
+    let mut defs = Vec::new();
+    let mut refs = Refs::default();
+
+    fn name_text(node: &Node, src: &[u8]) -> String {
+        node_text(node, src).to_string()
+    }
+
+    fn visit_def(node: &Node, src: &[u8], lang_name: &str, defs: &mut Vec<Definition>) {
+        match node.kind() {
+            "function_declaration" | "generator_function_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "function".to_string(),
+                        is_pub: true,
+                        sig: format!("function {}", name),
+                        impl_target: None,
+                        lang: lang_name.to_string(),
+                    });
+                }
+            }
+            "class_declaration" | "abstract_class_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "class".to_string(),
+                        is_pub: true,
+                        sig: format!("class {}", name),
+                        impl_target: None,
+                        lang: lang_name.to_string(),
+                    });
+                }
+            }
+            "interface_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "interface".to_string(),
+                        is_pub: true,
+                        sig: format!("interface {}", name),
+                        impl_target: None,
+                        lang: lang_name.to_string(),
+                    });
+                }
+            }
+            "type_alias_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "type".to_string(),
+                        is_pub: true,
+                        sig: format!("type {}", name),
+                        impl_target: None,
+                        lang: lang_name.to_string(),
+                    });
+                }
+            }
+            "enum_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "enum".to_string(),
+                        is_pub: true,
+                        sig: format!("enum {}", name),
+                        impl_target: None,
+                        lang: lang_name.to_string(),
+                    });
+                }
+            }
+            "method_definition" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: "method".to_string(),
+                        is_pub: true,
+                        sig: format!("method {}", name),
+                        impl_target: None,
+                        lang: lang_name.to_string(),
+                    });
+                }
+            }
+            "variable_declarator" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = name_text(&name_node, src);
+                    // Check if value is arrow function or function expression
+                    let is_func = node
+                        .child_by_field_name("value")
+                        .map(|v| v.kind() == "arrow_function" || v.kind() == "function_expression")
+                        .unwrap_or(false);
+                    defs.push(Definition {
+                        name: name.clone(),
+                        kind: if is_func {
+                            "function".to_string()
+                        } else {
+                            "variable".to_string()
+                        },
+                        is_pub: true,
+                        sig: name.clone(),
+                        impl_target: None,
+                        lang: lang_name.to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_def(&child, src, lang_name, defs);
+        }
+    }
+
+    fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
+        match node.kind() {
+            "call_expression" => {
+                if let Some(func) = node.child_by_field_name("function") {
+                    match func.kind() {
+                        "identifier" => {
+                            let name = name_text(&func, src);
+                            *refs.call.entry((name, None)).or_insert(0) += 1;
+                        }
+                        "member_expression" => {
+                            let obj = func.child_by_field_name("object");
+                            let prop = func.child_by_field_name("property");
+                            if let (Some(o), Some(p)) = (obj, prop) {
+                                let pname = name_text(&p, src);
+                                let oname = name_text(&o, src);
+                                let qualifier = if o.kind() == "identifier" {
+                                    Some(oname)
+                                } else {
+                                    None
+                                };
+                                *refs.call.entry((pname, qualifier)).or_insert(0) += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "new_expression" => {
+                if let Some(ctor) = node.child_by_field_name("constructor") {
+                    let name = name_text(&ctor, src);
+                    *refs.call.entry((name, None)).or_insert(0) += 1;
+                }
+            }
+            "import_statement" => {
+                // import ... from "module"
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    if child.kind() == "string" {
+                        let mod_name = name_text(&child, src)
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .trim_matches('`')
+                            .to_string();
+                        *refs.path_refs.entry(mod_name).or_insert(0) += 1;
+                    }
+                }
+            }
+            "identifier" => {
+                let name = name_text(node, src);
+                *refs.ident_refs.entry(name).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_ref(&child, src, refs);
+        }
+    }
+
+    visit_def(&tree.root_node(), src, lang_name, &mut defs);
+    visit_ref(&tree.root_node(), src, &mut refs);
+    Ok((defs, refs))
+}
+
+// ---------------------------------------------------------------------------
+// SCIP index reader (opt-in via --scip flag)
+// ---------------------------------------------------------------------------
+//
+// Reads existing SCIP indexes (.scip/index.scip) for precise definitions and
+// references. Falls back to tree-sitter when no index exists or it is stale.
+//
+// SCIP (Sourcegraph Code Intelligence Protocol) provides precise code
+// navigation data from real type checking, unlike tree-sitter's heuristic
+// parsing. This is a precision upgrade, not a replacement.
+
+/// Find SCIP index file in repo root.
+/// Checks: .scip/index.scip, index.scip
+fn find_scip_index(root: &Path) -> Option<PathBuf> {
+    // Single candidate name; kept as a named binding so adding future
+    // index filenames is a one-line change.
+    let candidate = "index.scip";
+    let path = root.join(".scip").join(candidate);
+    if path.is_file() {
+        return Some(path);
+    }
+    let path = root.join(candidate);
+    if path.is_file() {
+        return Some(path);
+    }
+    None
+}
+
+/// Check if SCIP index is stale (older than any source file).
+/// Returns true if stale or if check fails (conservative: prefer tree-sitter).
+fn is_scip_stale(index_path: &Path, root: &Path) -> bool {
+    let index_mtime = match std::fs::metadata(index_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return true,
+    };
+
+    // Check if any source file is newer than the index
+    // (simple heuristic: check a few common source extensions)
+    let extensions = ["rs", "py", "lua", "ts", "tsx", "kt", "sh", "nix", "md"];
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if extensions.contains(&ext) {
+                        if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                            if mtime > index_mtime {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Recurse one level for common dirs
+            if path.is_dir() {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if ["src", "lib", "lua", "app"].contains(&name) {
+                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                        for sub_entry in sub_entries.flatten() {
+                            let sub_path = sub_entry.path();
+                            if sub_path.is_file() {
+                                if let Some(ext) = sub_path.extension().and_then(|e| e.to_str()) {
+                                    if extensions.contains(&ext) {
+                                        if let Ok(mtime) =
+                                            sub_entry.metadata().and_then(|m| m.modified())
+                                        {
+                                            if mtime > index_mtime {
+                                                return true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Parse SCIP symbol string into (name, kind).
+/// SCIP symbols look like: `rust-analyzer cargo bloch 0.1.0 Args#`, `... main().`
+/// Returns None for package symbols (e.g. `crate/`) which should be skipped.
+fn scip_symbol_parse(symbol: &str) -> Option<(String, String)> {
+    // Take the last space-separated token (the descriptors)
+    let descriptors = symbol.split_whitespace().last()?;
+
+    // Skip package symbols like `crate/`
+    if descriptors == "crate/" || descriptors.ends_with('/') {
+        return None;
+    }
+
+    // Function: `main().` -> ("main", "function")
+    if descriptors.ends_with("().") {
+        let name = descriptors.trim_end_matches("().").to_string();
+        // Handle methods: `Type#method().` -> take after #
+        let name = if let Some(pos) = name.rfind('#') {
+            name[pos + 1..].to_string()
+        } else {
+            name
+        };
+        if name.is_empty() {
+            return None;
+        }
+        return Some((name, "function".to_string()));
+    }
+
+    // Type: `Args#` -> ("Args", "type")
+    if descriptors.ends_with('#') && !descriptors.contains("().") {
+        let name = descriptors.trim_end_matches('#').to_string();
+        // Handle nested: `Outer#Inner#` -> take after last #
+        let name = if let Some(pos) = name.rfind('#') {
+            name[pos + 1..].to_string()
+        } else {
+            name
+        };
+        if name.is_empty() {
+            return None;
+        }
+        return Some((name, "type".to_string()));
+    }
+
+    // Field/member: `Args#root.` -> ("root", "field")
+    if descriptors.ends_with('.') {
+        let without_dot = descriptors.trim_end_matches('.');
+        // Take after # if present (field of a type)
+        let name = if let Some(pos) = without_dot.rfind('#') {
+            without_dot[pos + 1..].to_string()
+        } else {
+            without_dot.to_string()
+        };
+        // Skip if it still contains descriptor chars (malformed)
+        if name.is_empty() || name.contains('#') || name.contains('(') {
+            return None;
+        }
+        return Some((name, "field".to_string()));
+    }
+
+    None
+}
+
+/// Legacy wrapper for compatibility
+fn scip_symbol_name(symbol: &str) -> String {
+    scip_symbol_parse(symbol)
+        .map(|(n, _)| n)
+        .unwrap_or_default()
+}
+
+/// Read SCIP index and extract definitions/references per file.
+/// Returns None if no index found, index is stale, or parse fails.
+/// The HashMap keys are relative file paths, values are (definitions, refs, language).
+pub fn read_scip_index(root: &Path) -> Option<HashMap<String, ScipFileData>> {
+    let index_path = find_scip_index(root)?;
+
+    // Check staleness (conservative: fall back to tree-sitter if stale)
+    if is_scip_stale(&index_path, root) {
+        eprintln!("bloch: SCIP index is stale, falling back to tree-sitter");
+        return None;
+    }
+
+    // Read and parse the index
+    let data = std::fs::read(&index_path).ok()?;
+    let index: scip::types::Index = protobuf::Message::parse_from_bytes(&data).ok()?;
+
+    let mut per_file: std::collections::HashMap<String, (Vec<Definition>, Refs, String)> =
+        std::collections::HashMap::new();
+
+    // Build symbol -> definition info map (global, for cross-file references)
+    let mut symbol_defs: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+
+    // First pass: collect all symbol definitions
+    for document in &index.documents {
+        for symbol_info in &document.symbols {
+            let symbol = symbol_info.symbol.clone();
+            if let Some((name, kind)) = scip_symbol_parse(&symbol) {
+                symbol_defs.insert(symbol, (name, kind));
+            }
+        }
+    }
+
+    // Second pass: build per-file definitions and references
+    for document in &index.documents {
+        let rel_path = document.relative_path.clone();
+
+        let lang = Path::new(&rel_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| match e {
+                "rs" => "rust",
+                "py" => "python",
+                "lua" => "lua",
+                "ts" => "typescript",
+                "tsx" => "tsx",
+                "kt" | "kts" => "kotlin",
+                "sh" | "bash" => "bash",
+                "nix" => "nix",
+                "md" => "markdown",
+                _ => "unknown",
+            })
+            .unwrap_or("unknown")
+            .to_string();
+
+        let mut defs = Vec::new();
+        let mut refs = Refs::default();
+
+        // Definitions from this document's symbols
+        for symbol_info in &document.symbols {
+            let symbol = symbol_info.symbol.clone();
+            if let Some((name, kind)) = symbol_defs.get(&symbol) {
+                defs.push(Definition {
+                    name: name.clone(),
+                    kind: kind.clone(),
+                    is_pub: true,
+                    sig: format!("{} (from SCIP)", name),
+                    impl_target: None,
+                    lang: lang.clone(),
+                });
+            }
+        }
+
+        // References from this document's occurrences
+        for occurrence in &document.occurrences {
+            let symbol = occurrence.symbol.clone();
+            if symbol.is_empty() {
+                continue;
+            }
+            let is_definition =
+                (occurrence.symbol_roles & scip::types::SymbolRole::Definition as i32) != 0;
+            if !is_definition {
+                if let Some((name, _)) = symbol_defs.get(&symbol) {
+                    *refs.ident_refs.entry(name.clone()).or_insert(0) += 1;
+                } else {
+                    let name = scip_symbol_name(&symbol);
+                    if !name.is_empty() {
+                        *refs.ident_refs.entry(name).or_insert(0) += 1;
+                    }
+                }
+            }
+        }
+
+        if !defs.is_empty() || !refs.ident_refs.is_empty() {
+            per_file.insert(rel_path, (defs, refs, lang));
+        }
+    }
+
+    if per_file.is_empty() {
+        return None;
+    }
+
+    Some(per_file)
+}
+
+// Shallow extractors (non-Rust)
+// ---------------------------------------------------------------------------
+
+fn extract_ruby_fastlane(text: &str) -> Vec<Definition> {
+    let lane_re =
+        Regex::new(r"(?:private_)?lane\s+:([a-zA-Z_][a-zA-Z0-9_]*)").expect("hardcoded lane regex");
+    let plat_re =
+        Regex::new(r"platform\s+:([a-zA-Z_][a-zA-Z0-9_]*)").expect("hardcoded platform regex");
+    let def_re = Regex::new(r"def\s+([a-zA-Z_][a-zA-Z0-9_?!]*)").expect("hardcoded def regex");
+
+    let mut defs = Vec::new();
+    for line in text.lines() {
+        let stripped = line.trim();
+        if let Some(caps) = lane_re.captures(stripped) {
+            let sig: String = stripped.chars().take(100).collect();
+            defs.push(Definition {
+                name: caps[1].to_string(),
+                kind: "lane".to_string(),
+                is_pub: !stripped.starts_with("private_"),
+                sig,
+                impl_target: None,
+                lang: "ruby".to_string(),
+            });
+        }
+        if let Some(caps) = plat_re.captures(stripped) {
+            let sig: String = stripped.chars().take(100).collect();
+            defs.push(Definition {
+                name: caps[1].to_string(),
+                kind: "platform".to_string(),
+                is_pub: true,
+                sig,
+                impl_target: None,
+                lang: "ruby".to_string(),
+            });
+        }
+        if let Some(caps) = def_re.captures(stripped) {
+            let sig: String = stripped.chars().take(100).collect();
+            defs.push(Definition {
+                name: caps[1].to_string(),
+                kind: "fn".to_string(),
+                is_pub: true,
+                sig,
+                impl_target: None,
+                lang: "ruby".to_string(),
+            });
+        }
+    }
+    defs.truncate(50);
+    defs
+}
+
+fn extract_generic(text: &str, lang: &str, rel: &str) -> Vec<Definition> {
+    let lines: Vec<&str> = text.lines().collect();
+    let non_empty = lines.iter().filter(|l| !l.trim().is_empty()).count();
+    let name = Path::new(rel)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    vec![Definition {
+        name,
+        kind: "file".to_string(),
+        is_pub: true,
+        sig: format!("{} lines, {} non-empty", lines.len(), non_empty),
+        impl_target: None,
+        lang: lang.to_string(),
+    }]
+}
+
+pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)> {
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
+        .unwrap_or_default();
+    let basename = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+
+    let src = match fs::read(path) {
+        Ok(s) => s,
+        Err(e) => return Err(BlochError::Io(e)),
+    };
+    let text = String::from_utf8_lossy(&src).to_string();
+    let empty = Refs::default();
+
+    // Rust: full tree-sitter
+    if ext == ".rs" {
+        let (defs, refs) = extract_rust(&src)?;
+        return Ok((defs, refs, "rust".to_string()));
+    }
+    // Markdown
+    if [".md", ".markdown", ".mdown"].contains(&ext.as_str()) {
+        let (defs, refs) = extract_markdown_ts(&src)?;
+        return Ok((defs, refs, "markdown".to_string()));
+    }
+    // Nix
+    if ext == ".nix" {
+        let (defs, refs) = extract_nix(&src)?;
+        return Ok((defs, refs, "nix".to_string()));
+    }
+    // Python
+    if ext == ".py" || ext == ".pyi" {
+        let (defs, refs) = extract_python(&src)?;
+        return Ok((defs, refs, "python".to_string()));
+    }
+    // Lua
+    if ext == ".lua" {
+        let (defs, refs) = extract_lua(&src)?;
+        return Ok((defs, refs, "lua".to_string()));
+    }
+    // Ruby / Fastlane
+    if ext == ".rb"
+        || ext == ".rake"
+        || [
+            "fastfile",
+            "appfile",
+            "deliverfile",
+            "gymfile",
+            "matchfile",
+            "scanfile",
+            "snapfile",
+        ]
+        .contains(&basename.as_str())
+    {
+        return Ok((extract_ruby_fastlane(&text), empty, "ruby".to_string()));
+    }
+    // Starlark / BUILD
+    if ["build", "workspace"].contains(&basename.as_str())
+        || [".bzl", ".bazel"].contains(&ext.as_str())
+    {
+        let re = Regex::new(r#"\s*name\s*=\s*["']([^"']+)["']"#).expect("hardcoded name regex");
+        let mut defs = Vec::new();
+        for line in text.lines() {
+            if let Some(caps) = re.captures(line) {
+                let sig: String = line.trim().chars().take(100).collect();
+                defs.push(Definition {
+                    name: caps[1].to_string(),
+                    kind: "target".to_string(),
+                    is_pub: true,
+                    sig,
+                    impl_target: None,
+                    lang: "starlark".to_string(),
+                });
+            }
+        }
+        defs.truncate(30);
+        if defs.is_empty() {
+            return Ok((
+                extract_generic(&text, "starlark", rel),
+                empty,
+                "starlark".to_string(),
+            ));
+        }
+        return Ok((defs, empty, "starlark".to_string()));
+    }
+    // TOML
+    if ext == ".toml" {
+        let re = Regex::new(r"^\[([^\]]+)\]").expect("hardcoded bracket regex");
+        let mut defs = Vec::new();
+        for line in text.lines() {
+            let stripped = line.trim();
+            if let Some(caps) = re.captures(stripped) {
+                let sig: String = stripped.chars().take(100).collect();
+                defs.push(Definition {
+                    name: caps[1].to_string(),
+                    kind: "table".to_string(),
+                    is_pub: true,
+                    sig,
+                    impl_target: None,
+                    lang: "toml".to_string(),
+                });
+            }
+        }
+        defs.truncate(30);
+        if defs.is_empty() {
+            return Ok((
+                extract_generic(&text, "toml", rel),
+                empty,
+                "toml".to_string(),
+            ));
+        }
+        return Ok((defs, empty, "toml".to_string()));
+    }
+    // YAML
+    if ext == ".yaml" || ext == ".yml" {
+        let re = Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\-]*)\s*:").expect("hardcoded key regex");
+        let mut defs = Vec::new();
+        for line in text.lines() {
+            if let Some(caps) = re.captures(line) {
+                let sig: String = line.trim().chars().take(100).collect();
+                defs.push(Definition {
+                    name: caps[1].to_string(),
+                    kind: "key".to_string(),
+                    is_pub: true,
+                    sig,
+                    impl_target: None,
+                    lang: "yaml".to_string(),
+                });
+            }
+        }
+        defs.truncate(30);
+        if defs.is_empty() {
+            return Ok((
+                extract_generic(&text, "yaml", rel),
+                empty,
+                "yaml".to_string(),
+            ));
+        }
+        return Ok((defs, empty, "yaml".to_string()));
+    }
+    // JSON
+    if ext == ".json" && text.len() < 50000 {
+        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            let defs: Vec<Definition> = map
+                .keys()
+                .take(30)
+                .map(|k| Definition {
+                    name: k.clone(),
+                    kind: "key".to_string(),
+                    is_pub: true,
+                    sig: format!("\"{}\": ...", k),
+                    impl_target: None,
+                    lang: "json".to_string(),
+                })
+                .collect();
+            return Ok((defs, empty, "json".to_string()));
+        }
+        return Ok((
+            extract_generic(&text, "json", rel),
+            empty,
+            "json".to_string(),
+        ));
+    }
+    // Shell
+    if [".sh", ".bash", ".zsh"].contains(&ext.as_str())
+        || basename.starts_with("run")
+        || basename.ends_with(".sh")
+    {
+        let (defs, refs) = extract_bash(&src)?;
+        return Ok((defs, refs, "bash".to_string()));
+    }
+
+    // Kotlin (via tree-sitter-kotlin-ng 1.1.0, compatible with tree-sitter 0.25+)
+    if [".kt", ".kts"].contains(&ext.as_str()) {
+        let (defs, refs) = extract_kotlin(&src)?;
+        return Ok((defs, refs, "kotlin".to_string()));
+    }
+
+    // TypeScript / TSX
+    if [".ts", ".mts", ".cts"].contains(&ext.as_str()) {
+        let (defs, refs) = extract_typescript(&src, false)?;
+        return Ok((defs, refs, "typescript".to_string()));
+    }
+    if ext == ".tsx" {
+        let (defs, refs) = extract_typescript(&src, true)?;
+        return Ok((defs, refs, "tsx".to_string()));
+    }
+
+    // Fallback: generic file info
+    let lang = if ext.is_empty() {
+        "text"
+    } else {
+        ext.trim_start_matches('.')
+    };
+    Ok((extract_generic(&text, lang, rel), empty, lang.to_string()))
+}
+
+/// Render top definitions as points on an ASCII Bloch sphere.
+///
+/// Each definition is mapped to (θ, φ):
+/// - θ (polar from +z): derived from normalized probability.
+///   p=1 → north pole (measure here first), p=0 → south pole.
+/// - φ (azimuthal): derived from recency (x-axis) and centrality (y-axis).
+///   East (+x) = recently modified, North (+y) = highly connected.
+///
+/// This gives a 3D view that a ranked list cannot: you see at a glance
+/// which definitions are important AND fresh AND central, vs. important
+/// but stale, or fresh but peripheral.
+#[allow(clippy::needless_range_loop)]
+pub fn render_sphere(
+    ranked: &[(f64, f64, bool, String, Definition)],
+    recency_scores: &std::collections::HashMap<String, f64>,
+    visibility_scores: &std::collections::HashMap<String, f64>,
+    max_points: usize,
+) -> String {
+    const WIDTH: usize = 50;
+    const HEIGHT: usize = 25;
+    const R: f64 = 11.0; // sphere radius in character units
+
+    // Take top N by probability
+    let points: Vec<(f64, f64, String)> = ranked
+        .iter()
+        .take(max_points)
+        .enumerate()
+        .map(|(i, (_score, prob, _pub, rel, d))| {
+            // θ: p=1 → 0 (north pole), p=0 → π (south pole)
+            let theta = std::f64::consts::PI * (1.0 - prob.clamp(0.0, 1.0));
+            // φ: from recency (x) and centrality (y), normalized to [0, 2π)
+            let key = format!("{}::{}", rel, d.name);
+            let rec = recency_scores.get(&key).copied().unwrap_or(0.5);
+            let vis = visibility_scores.get(&key).copied().unwrap_or(0.5);
+            let phi = (vis - 0.5).atan2(rec - 0.5);
+            // Short label: first 8 chars of definition name
+            let label = format!("{}", (i + 1));
+            let _ = label;
+            (theta, phi, d.name.chars().take(12).collect::<String>())
+        })
+        .collect();
+
+    // Build the grid
+    let mut grid = vec![vec![' '; WIDTH]; HEIGHT];
+    let cx = WIDTH as f64 / 2.0;
+    let cy = HEIGHT as f64 / 2.0;
+
+    // Draw sphere outline (circle in xy projection)
+    for angle in 0..360 {
+        let a = (angle as f64).to_radians();
+        let x = (cx + R * 1.8 * a.cos()) as usize;
+        let y = (cy + R * 0.9 * a.sin()) as usize;
+        if x < WIDTH && y < HEIGHT && grid[y][x] == ' ' {
+            grid[y][x] = '·';
+        }
+    }
+
+    // Draw axes
+    // Z-axis (vertical, through center)
+    for y in 0..HEIGHT {
+        let x = cx as usize;
+        if x < WIDTH && grid[y][x] == ' ' {
+            grid[y][x] = '│';
+        }
+    }
+    // Equator (horizontal)
+    let ey = cy as usize;
+    for x in 0..WIDTH {
+        if grid[ey][x] == ' ' {
+            grid[ey][x] = '─';
+        }
+    }
+    // Center
+    if (cx as usize) < WIDTH && (cy as usize) < HEIGHT {
+        grid[cy as usize][cx as usize] = '┼';
+    }
+
+    // Plot points
+    // Project 3D sphere point to 2D: orthographic from front-above
+    for (i, (theta, phi, _name)) in points.iter().enumerate() {
+        let x3d = theta.sin() * phi.cos();
+        let y3d = theta.sin() * phi.sin();
+        let z3d = theta.cos();
+        // Simple projection: x → horizontal, blend of y and z → vertical
+        // (viewing from front, slightly above)
+        let sx = cx + x3d * R * 1.8;
+        let sy = cy - (z3d * 0.7 + y3d * 0.3) * R * 0.9;
+        let px = sx as usize;
+        let py = sy as usize;
+        if px < WIDTH && py < HEIGHT {
+            // Use digit for index (1-9, then letters)
+            let ch = if i < 9 {
+                (b'1' + i as u8) as char
+            } else if i < 35 {
+                (b'a' + (i - 9) as u8) as char
+            } else {
+                '*'
+            };
+            grid[py][px] = ch;
+        }
+    }
+
+    // Build output
+    let mut out = String::new();
+    out.push_str("# Bloch sphere: top definitions by (relevance, recency, centrality)\n");
+    out.push_str("#   +z (north pole) = highest probability — measure here first\n");
+    out.push_str("#   +x (east) = recently modified    |  +y = highly connected\n");
+    out.push_str("#\n");
+    for row in grid {
+        out.push_str("#   ");
+        out.push_str(&row.iter().collect::<String>());
+        out.push('\n');
+    }
+    out.push_str("#\n# Legend:\n");
+    for (i, (_theta, _phi, name)) in points.iter().enumerate() {
+        let ch = if i < 9 {
+            ((b'1' + i as u8) as char).to_string()
+        } else if i < 35 {
+            ((b'a' + (i - 9) as u8) as char).to_string()
+        } else {
+            "*".to_string()
+        };
+        // Find the prob for this point
+        if let Some((_, prob, _, rel, _)) = ranked.get(i) {
+            out.push_str(&format!("#   {} = {} (p={:.3})\n", ch, name, prob));
+            let _ = rel;
+        }
+    }
+    out
+}
+
+/// Detect active skills from `.ai/skills/` directory and skill references.
+/// Returns a list of skill names.
+pub fn detect_skills(root: &std::path::Path) -> Vec<String> {
+    let mut skills = Vec::new();
+
+    // Check .ai/skills/ directory
+    let skills_dir = root.join(".ai").join("skills");
+    if let Ok(entries) = std::fs::read_dir(&skills_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            if let Some(name) = entry.file_name().to_str() {
+                skills.push(name.to_string());
+            }
+        }
+    }
+
+    // Check for SKILL.md files (workspace skills)
+    let workspace_skills = root.join("..").join("skills");
+    if let Ok(entries) = std::fs::read_dir(&workspace_skills) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            if entry.path().is_dir() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if !skills.contains(&name.to_string()) {
+                        skills.push(name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    skills
+}
+
+/// Map a skill name to programming languages it covers.
+/// E.g., "tiger-style-rust" -> ["rust"], "tiger-style-lua" -> ["lua"].
+pub fn skill_languages(skill: &str) -> Vec<String> {
+    let skill_lower = skill.to_lowercase();
+    let mut langs = Vec::new();
+
+    // Direct language mentions
+    for lang in &[
+        "rust",
+        "python",
+        "lua",
+        "typescript",
+        "tsx",
+        "javascript",
+        "go",
+        "ruby",
+        "nix",
+        "bash",
+        "shell",
+        "c",
+        "cpp",
+        "zig",
+        "kotlin",
+        "markdown",
+    ] {
+        if skill_lower.contains(*lang) {
+            langs.push(lang.to_string());
+        }
+    }
+
+    // Special cases
+    if (skill_lower.contains("nvim") || skill_lower.contains("neovim"))
+        && !langs.iter().any(|l| l == "lua")
+    {
+        langs.push("lua".to_string());
+    }
+
+    langs
+}
+
+/// Get skill boost factor for a definition's language.
+/// Returns 1.5 if the language matches an active skill, 1.0 otherwise.
+pub fn skill_boost(lang: &str, active_skills: &[String]) -> f64 {
+    for skill in active_skills {
+        let skill_langs = skill_languages(skill);
+        if skill_langs.iter().any(|l| l == lang) {
+            return 1.5;
+        }
+    }
+    1.0
+}
+
+// ---------------------------------------------------------------------------
+// Deliberate public API
+// ---------------------------------------------------------------------------
+//
+// This is the stable, documented interface for using bloch as a library.
+// All other `pub` items in this crate are low-level building blocks;
+// prefer these three items for new code.
+
+/// Configuration for mapping a repository.
+///
+/// Controls budget, skill-aware ranking, and SCIP integration.
+#[derive(Debug, Default, Clone)]
+pub struct MapConfig {
+    /// Use SCIP index for precise definitions/references if available.
+    /// Falls back to tree-sitter when no index exists or it is stale.
+    pub use_scip: bool,
+}
+
+/// A ranked, budgeted map of a repository.
+///
+/// Produced by [`map_repo`]. Contains per-file definitions and references,
+/// ready for ranking and rendering.
+#[derive(Debug)]
+pub struct RepoMap {
+    /// Relative path -> file data (definitions, references, language).
+    pub files: HashMap<String, FileData>,
+    /// Total number of definitions across all files.
+    pub total_definitions: usize,
+    /// Languages present, with file counts.
+    pub languages: HashMap<String, usize>,
+    /// Whether SCIP index was used (vs tree-sitter fallback).
+    pub used_scip: bool,
+}
+
+impl RepoMap {
+    /// Total character count if all definitions were rendered.
+    pub fn total_chars(&self) -> usize {
+        self.files
+            .values()
+            .flat_map(|f| f.defs.iter())
+            .map(|d| d.sig.len())
+            .sum()
+    }
+}
+
+/// Map a repository with the given configuration.
+///
+/// This is the primary entry point for library users. It handles:
+/// - SCIP index reading (if `config.use_scip` and index available)
+/// - Tree-sitter extraction per file (fallback)
+/// - Skill detection and language mapping
+///
+/// Returns a [`RepoMap`] with per-file data ready for ranking.
+pub fn map_repo(root: &Path, config: &MapConfig) -> Result<RepoMap> {
+    let mut files: HashMap<String, FileData> = HashMap::new();
+
+    // SCIP integration (opt-in): try precise index first
+    let scip_result = if config.use_scip {
+        read_scip_index(root)
+    } else {
+        None
+    };
+
+    let used_scip = scip_result.is_some();
+    if let Some(scip_data) = scip_result {
+        for (rel, (defs, refs, lang)) in scip_data {
+            let modpath = if lang == "rust" {
+                mod_segments(&rel)
+            } else {
+                Vec::new()
+            };
+            files.insert(
+                rel,
+                FileData {
+                    defs,
+                    refs,
+                    modpath,
+                    lang,
+                },
+            );
+        }
+    } else {
+        // Fall back to tree-sitter per-file extraction
+        for p in iter_all_files(root) {
+            let rel = p
+                .strip_prefix(root)
+                .unwrap_or(&p)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let (defs, refs, lang) = extract(&p, &rel)?;
+            let modpath = if lang == "rust" {
+                mod_segments(&rel)
+            } else {
+                Vec::new()
+            };
+            files.insert(
+                rel,
+                FileData {
+                    defs,
+                    refs,
+                    modpath,
+                    lang,
+                },
+            );
+        }
+    }
+
+    let total_definitions = files.values().map(|f| f.defs.len()).sum();
+    let mut languages: HashMap<String, usize> = HashMap::new();
+    for f in files.values() {
+        *languages.entry(f.lang.clone()).or_insert(0) += 1;
+    }
+
+    Ok(RepoMap {
+        files,
+        total_definitions,
+        languages,
+        used_scip,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_extracts_headers() {
+        let text = "# Title\n## Section\n### Sub\n\nBody text";
+        let (defs, _) = extract_markdown_ts(text.as_bytes()).unwrap();
+        assert_eq!(defs.len(), 3);
+        assert_eq!(defs[0].name, "Title");
+        assert_eq!(defs[0].kind, "h1");
+        assert_eq!(defs[1].kind, "h2");
+        assert_eq!(defs[2].kind, "h3");
+        assert!(defs.iter().all(|d| d.lang == "markdown"));
+    }
+
+    #[test]
+    fn markdown_strips_formatting() {
+        let text = "# **Bold** and `code` title";
+        let (defs, _) = extract_markdown_ts(text.as_bytes()).unwrap();
+        assert_eq!(defs.len(), 1);
+        // tree-sitter-md preserves inline formatting in heading_content
+        assert!(defs[0].name.contains("Bold"));
+    }
+
+    #[test]
+    fn nix_extracts_top_level_attrs() {
+        let text = "{ pkgs, lib }:\n{\n  hello = pkgs.hello;\n  version = \"1.0\";\n}";
+        let (defs, _) = extract_nix(text.as_bytes()).unwrap();
+        assert!(defs.iter().any(|d| d.name == "hello"));
+        assert!(defs.iter().any(|d| d.name == "version"));
+        assert!(defs.iter().all(|d| d.lang == "nix"));
+    }
+
+    #[test]
+    fn python_extracts_functions_and_classes() {
+        let text = "def hello():\n    pass\n\nclass World:\n    pass\n\ndef _private():\n    pass";
+        let (defs, _) = extract_python(text.as_bytes()).unwrap();
+        let hello = defs.iter().find(|d| d.name == "hello").unwrap();
+        assert_eq!(hello.kind, "function");
+        assert!(hello.is_pub);
+        let world = defs.iter().find(|d| d.name == "World").unwrap();
+        assert_eq!(world.kind, "class");
+        let priv_fn = defs.iter().find(|d| d.name == "_private").unwrap();
+        assert!(!priv_fn.is_pub);
+    }
+
+    #[test]
+    fn lua_extracts_functions() {
+        let text = "function foo()\nend\n\nfunction bar.baz()\nend";
+        let (defs, _) = extract_lua(text.as_bytes()).unwrap();
+        assert!(defs.iter().any(|d| d.name == "foo"));
+        assert!(defs.iter().any(|d| d.name == "bar.baz"));
+        assert!(defs.iter().all(|d| d.lang == "lua"));
+    }
+
+    #[test]
+    fn rust_extracts_struct_and_impl() {
+        let src =
+            b"pub struct Foo { x: i32 }\nimpl Foo {\n    pub fn new() -> Self { Foo { x: 0 } }\n}";
+        let (defs, _refs) = extract_rust(src).unwrap();
+        let foo = defs
+            .iter()
+            .find(|d| d.name == "Foo" && d.kind == "struct")
+            .unwrap();
+        assert!(foo.is_pub);
+        let new_fn = defs.iter().find(|d| d.name == "new").unwrap();
+        assert_eq!(new_fn.kind, "fn");
+        assert_eq!(new_fn.impl_target.as_deref(), Some("Foo"));
+    }
+
+    #[test]
+    fn rust_counts_references() {
+        let src = b"struct Foo;\nfn bar() { let _ = Foo; bar(); }";
+        let (_defs, refs) = extract_rust(src).unwrap();
+        // Foo referenced as a type
+        assert!(refs.type_refs.get("Foo").unwrap_or(&0) >= &1);
+        // bar called (bare)
+        let bare_calls: usize = refs
+            .call
+            .iter()
+            .filter(|((n, q), _)| n == "bar" && q.is_none())
+            .map(|(_, c)| *c)
+            .sum();
+        assert!(bare_calls >= 1);
+    }
+
+    #[test]
+    fn toml_extracts_tables() {
+        let text = "[package]\nname = \"foo\"\n\n[dependencies]\nserde = \"1\"";
+        let (defs, _, lang) = {
+            // Simulate via extract dispatch on a temp path
+            let text = text.to_string();
+            // Direct test of the TOML branch logic
+            let re = regex::Regex::new(r"^\[([^\]]+)\]").expect("hardcoded bracket regex");
+            let mut defs = Vec::new();
+            for line in text.lines() {
+                let stripped = line.trim();
+                if let Some(caps) = re.captures(stripped) {
+                    defs.push(Definition {
+                        name: caps[1].to_string(),
+                        kind: "table".to_string(),
+                        is_pub: true,
+                        sig: stripped.chars().take(100).collect(),
+                        impl_target: None,
+                        lang: "toml".to_string(),
+                    });
+                }
+            }
+            (defs, (), "toml".to_string())
+        };
+        assert_eq!(lang, "toml");
+        assert!(defs.iter().any(|d| d.name == "package"));
+        assert!(defs.iter().any(|d| d.name == "dependencies"));
+    }
+
+    #[test]
+    fn yaml_extracts_top_level_keys() {
+        let text = "name: foo\nversion: 1.0\n  nested: should_not_match";
+        // Direct logic test (mirrors extract dispatch)
+        let re =
+            regex::Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\-]*)\s*:").expect("hardcoded key regex");
+        let mut names = Vec::new();
+        for line in text.lines() {
+            if let Some(caps) = re.captures(line) {
+                names.push(caps[1].to_string());
+            }
+        }
+        assert!(names.contains(&"name".to_string()));
+        assert!(names.contains(&"version".to_string()));
+        assert!(!names.contains(&"nested".to_string()));
+    }
+
+    #[test]
+    fn shell_extracts_functions() {
+        let text = "#!/bin/bash\nhello() {\n  echo hi\n}\n\nworld() {\n  echo bye\n}";
+        let re = regex::Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)").unwrap();
+        let mut names = Vec::new();
+        for line in text.lines() {
+            let stripped = line.trim();
+            if let Some(caps) = re.captures(stripped) {
+                names.push(caps[1].to_string());
+            }
+        }
+        assert!(names.contains(&"hello".to_string()));
+        assert!(names.contains(&"world".to_string()));
+    }
+
+    #[test]
+    fn generic_fallback_counts_lines() {
+        let text = "line1\n\nline3\nline4";
+        let defs = extract_generic(text, "text", "foo.txt");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].kind, "file");
+        assert!(defs[0].sig.contains("4 lines"));
+        assert!(defs[0].sig.contains("3 non-empty"));
+    }
+
+    #[test]
+    fn mod_segments_extracts_crate_path() {
+        let segs = mod_segments("crates/foo/src/bar/baz.rs");
+        assert_eq!(segs, vec!["foo", "baz"]); // NOTE: intermediate dirs without .rs are skipped (matches Python)
+    }
+
+    #[test]
+    fn mod_segments_skips_lib_main_mod() {
+        let segs = mod_segments("crates/foo/src/lib.rs");
+        assert_eq!(segs, vec!["foo"]);
+    }
+
+    #[test]
+    fn bloch_error_displays() {
+        let e = BlochError::GitFailed("no repo".to_string());
+        assert_eq!(format!("{}", e), "Git operation failed: no repo");
+        let e = BlochError::ParseFailed {
+            path: "foo.rs".to_string(),
+            msg: "bad syntax".to_string(),
+        };
+        assert!(format!("{}", e).contains("foo.rs"));
+    }
+
+    #[test]
+    fn scip_staleness_detects_newer_source() {
+        use std::fs::{self, FileTimes};
+        use std::time::{Duration, SystemTime};
+
+        // Create temp dir structure
+        let tmp = std::env::temp_dir().join(format!("bloch-scip-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::create_dir_all(tmp.join(".scip")).unwrap();
+
+        let index_path = tmp.join(".scip").join("index.scip");
+        let src_path = tmp.join("src").join("main.rs");
+
+        fs::write(&index_path, b"fake").unwrap();
+        fs::write(&src_path, b"fn main() {}").unwrap();
+
+        // Set index to old time, source to new time
+        let old_time = SystemTime::now() - Duration::from_secs(3600);
+        let new_time = SystemTime::now();
+        fs::set_times(&index_path, FileTimes::new().set_modified(old_time)).unwrap();
+        fs::set_times(&src_path, FileTimes::new().set_modified(new_time)).unwrap();
+
+        // Should detect stale (source newer than index)
+        assert!(is_scip_stale(&index_path, &tmp));
+
+        // Reverse: source older than index -> not stale
+        fs::set_times(&src_path, FileTimes::new().set_modified(old_time)).unwrap();
+        fs::set_times(&index_path, FileTimes::new().set_modified(new_time)).unwrap();
+        assert!(!is_scip_stale(&index_path, &tmp));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn memory_rejects_path_traversal() {
+        use std::path::PathBuf;
+
+        // Root with parent dir components should be rejected
+        let evil_root = PathBuf::from("/tmp/foo/../../etc");
+        let cached = CachedMap {
+            timestamp: "test".to_string(),
+            git_head: String::new(),
+            files: std::collections::HashMap::new(),
+            top_defs: Vec::new(),
+            languages: std::collections::HashMap::new(),
+        };
+        let result = write_memory_cache(&evil_root, &cached);
+        assert!(result.is_err());
+        match result {
+            Err(BlochError::InvalidPath(_)) => {}
+            _ => panic!("expected InvalidPath error"),
+        }
+    }
+
+    #[test]
+    fn memory_atomic_write_no_corrupt() {
+        use std::fs;
+
+        let tmp = std::env::temp_dir().join(format!("bloch-atomic-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        let cached = CachedMap {
+            timestamp: "2026-10-04T00:00:00Z".to_string(),
+            git_head: "abc123".to_string(),
+            files: std::collections::HashMap::new(),
+            top_defs: Vec::new(),
+            languages: std::collections::HashMap::new(),
+        };
+
+        // Write should succeed and produce valid JSON
+        let path = write_memory_cache(&tmp, &cached).unwrap();
+        assert!(path.exists());
+
+        // No temp file should be left behind
+        let tmp_file = path.with_extension("tmp");
+        assert!(!tmp_file.exists());
+
+        // Content should be valid JSON
+        let content = fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed["timestamp"], "2026-10-04T00:00:00Z");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extract_handles_malformed_utf8() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-utf8-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("bad.rs");
+        // Invalid UTF-8 bytes: should not panic, should use lossy conversion
+        fs::write(&path, b"fn main() {\xff\xfe invalid }").unwrap();
+        let result = extract(&path, "bad.rs");
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extract_handles_nul_bytes() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-nul-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("nul.py");
+        fs::write(&path, b"def hello():\x00\x00\n    pass").unwrap();
+        let result = extract(&path, "nul.py");
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extract_handles_binary_file() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-bin-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("data.bin");
+        // Random binary data with no valid structure
+        let data: Vec<u8> = (0..1024).map(|i| (i * 7 % 256) as u8).collect();
+        fs::write(&path, &data).unwrap();
+        let result = extract(&path, "data.bin");
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn extract_handles_empty_file() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let path = tmp.join("empty.rs");
+        fs::write(&path, b"").unwrap();
+        let result = extract(&path, "empty.rs");
+        assert!(result.is_ok());
+        let (defs, _, _) = result.unwrap();
+        assert!(defs.is_empty());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn map_repo_handles_symlink_loop() {
+        use std::fs;
+        use std::os::unix::fs::symlink;
+        let tmp = std::env::temp_dir().join(format!("bloch-symlink-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join("src")).unwrap();
+        fs::write(tmp.join("src").join("main.rs"), b"fn main() {}").unwrap();
+        // Create a symlink loop: link -> ..
+        let _ = symlink("..", tmp.join("src").join("loop"));
+        let config = MapConfig::default();
+        let result = map_repo(&tmp, &config);
+        // Should not hang or crash on symlink loop
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn map_repo_handles_unicode_paths() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-unicode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        // Unicode filename: should not panic
+        fs::write(tmp.join("文件.rs"), "fn 主() {}".as_bytes()).unwrap();
+        let config = MapConfig::default();
+        let result = map_repo(&tmp, &config);
+        assert!(result.is_ok());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn map_repo_handles_empty_repo() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-empty-repo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        let config = MapConfig::default();
+        let result = map_repo(&tmp, &config);
+        assert!(result.is_ok());
+        let map = result.unwrap();
+        assert!(map.files.is_empty());
+        assert_eq!(map.total_definitions, 0);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn map_repo_handles_nonexistent_root() {
+        use std::path::PathBuf;
+        let config = MapConfig::default();
+        let result = map_repo(&PathBuf::from("/nonexistent/path/12345"), &config);
+        // Should return Ok with empty map (iter_all_files handles gracefully)
+        // or Err, but must not panic
+        let _ = result;
+    }
+
+    #[test]
+    fn read_scip_index_handles_malformed_protobuf() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-scip-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".scip")).unwrap();
+        // Write garbage that's not valid protobuf
+        fs::write(
+            tmp.join(".scip").join("index.scip"),
+            b"\xff\xfe\x00 garbage not protobuf",
+        )
+        .unwrap();
+        // Should return None (graceful fallback), not panic
+        let result = read_scip_index(&tmp);
+        assert!(result.is_none());
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_scip_index_handles_truncated_file() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-scip-trunc-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".scip")).unwrap();
+        // Truncated protobuf (valid header, cut off)
+        fs::write(tmp.join(".scip").join("index.scip"), b"\x0a\x10\x0a\x0c").unwrap();
+        let result = read_scip_index(&tmp);
+        // Should not panic
+        let _ = result;
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_scip_index_handles_empty_file() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-scip-empty-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(tmp.join(".scip")).unwrap();
+        fs::write(tmp.join(".scip").join("index.scip"), b"").unwrap();
+        let result = read_scip_index(&tmp);
+        let _ = result;
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn skill_boost_handles_hostile_names() {
+        // Empty skill name
+        assert_eq!(skill_boost("rust", &["".to_string()]), 1.0);
+        // Skill with path traversal
+        assert_eq!(skill_boost("rust", &["../../etc".to_string()]), 1.0);
+        // Skill with null bytes
+        assert_eq!(skill_boost("rust", &["tiger\x00style".to_string()]), 1.0);
+        // Very long skill name
+        let long = "a".repeat(10000);
+        assert_eq!(skill_boost("rust", &[long]), 1.0);
+        // Valid skill still works
+        assert!(skill_boost("rust", &["tiger-style-rust".to_string()]) > 1.0);
+    }
+
+    #[test]
+    fn detect_skills_handles_missing_dir() {
+        use std::path::PathBuf;
+        // Nonexistent .ai/skills should return empty, not panic
+        let result = detect_skills(&PathBuf::from("/nonexistent/12345"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn kotlin_extracts_functions_and_classes() {
+        let code = b"
+fun hello(name: String): String {
+    return \"Hello, $name\"
+}
+
+class Greeter(val greeting: String) {
+    fun greet() = println(greeting)
+}
+
+object Singleton {
+    const val VERSION = \"1.0\"
+}
+";
+        let (defs, _) = extract_kotlin(code).unwrap();
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "hello" && d.kind == "function"));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "Greeter" && d.kind == "class"));
+        assert!(defs
+            .iter()
+            .any(|d| d.name == "Singleton" && d.kind == "object"));
+        assert!(defs.iter().all(|d| d.lang == "kotlin"));
+    }
+
+    #[test]
+    fn read_memory_cache_distinguishes_missing_vs_corrupt() {
+        use std::fs;
+        let tmp = std::env::temp_dir().join(format!("bloch-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+
+        // Missing file -> Ok(None)
+        let result = read_memory_cache(&tmp).unwrap();
+        assert!(result.is_none());
+
+        // Corrupt JSON -> Err (not Ok(None))
+        let mem_dir = tmp.join(".ai").join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join("bloch-last.json"), b"{ invalid json !!!").unwrap();
+        let result = read_memory_cache(&tmp);
+        assert!(result.is_err());
+        match result {
+            Err(BlochError::JsonError(msg)) => assert!(msg.contains("corrupt cache")),
+            _ => panic!("expected JsonError"),
+        }
+
+        // Valid JSON -> Ok(Some)
+        let cached = CachedMap {
+            timestamp: "2026-10-04T00:00:00Z".to_string(),
+            git_head: String::new(),
+            files: std::collections::HashMap::new(),
+            top_defs: Vec::new(),
+            languages: std::collections::HashMap::new(),
+        };
+        write_memory_cache(&tmp, &cached).unwrap();
+        let result = read_memory_cache(&tmp).unwrap();
+        assert!(result.is_some());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+}

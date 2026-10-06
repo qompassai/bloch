@@ -1,8 +1,10 @@
 //! bloch: ranked, budgeted codebase maps for coding agents.
 use bloch::{
     detect_skills, diff_maps, get_file_recency_boost, get_file_why, get_memory_context,
-    get_session_state, get_test_status, map_repo, read_memory_cache, render_sphere, skill_boost,
-    write_memory_cache, write_memory_summary, CachedMap, Definition, MapConfig, RefKey, RefKind,
+    get_session_state, get_test_status, git_ahead_behind, git_wip_detail, map_repo, memory_inbox,
+    memory_promote, memory_read, read_memory_cache, render_sphere, skill_boost, todo_add,
+    todo_done, todo_drop, todo_list, write_memory_cache, write_memory_summary, CachedMap,
+    Definition, MapConfig, RefKey, RefKind,
 };
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
@@ -60,6 +62,51 @@ enum Command {
         #[command(subcommand)]
         op: MemoryOp,
     },
+    /// Todo list operations (.ai/todo.md)
+    Todo {
+        /// Root of the repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[command(subcommand)]
+        op: TodoOp,
+    },
+    /// Git repository helpers for agents
+    Git {
+        /// Root of the repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[command(subcommand)]
+        op: GitOp,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum TodoOp {
+    /// Add a todo item
+    Add {
+        /// Item text
+        text: String,
+    },
+    /// List all todo items
+    List,
+    /// Mark a todo item done
+    Done {
+        /// Item ID
+        id: usize,
+    },
+    /// Remove a todo item
+    Drop {
+        /// Item ID
+        id: usize,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum GitOp {
+    /// Agent-friendly git status (branch, ahead/behind, dirty files)
+    Status,
+    /// Detailed WIP: per-file diff stats for uncommitted changes
+    Wip,
 }
 
 #[derive(clap::Subcommand)]
@@ -85,6 +132,26 @@ enum MemoryOp {
     },
     /// List all memory files with sizes
     List,
+    /// Read INDEX.md and current.md (session-start helper, bounded)
+    Read,
+    /// Write a timestamped inbox entry
+    Inbox {
+        /// Topic slug for the file name
+        topic: String,
+        /// Content to write
+        content: String,
+        /// Agent name for the file name (default: agent)
+        #[arg(long, default_value = "agent")]
+        agent: String,
+    },
+    /// Promote an inbox entry to a curated memory file
+    Promote {
+        /// Inbox file name (e.g. 1234567890-agent-topic.md)
+        file: String,
+        /// Target: decisions.md, patterns.md, or current.md
+        #[arg(long)]
+        to: String,
+    },
 }
 
 fn main() {
@@ -175,9 +242,97 @@ fn main() {
                     println!("(no memory directory at {})", mem_dir.display());
                 }
             },
+            MemoryOp::Read => {
+                print!("{}", memory_read(&root));
+            }
+            MemoryOp::Inbox {
+                topic,
+                content,
+                agent,
+            } => match memory_inbox(&root, agent, topic, content) {
+                Ok(fname) => eprintln!("bloch: inbox entry written: {}", fname),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            MemoryOp::Promote { file, to } => match memory_promote(&root, file, to) {
+                Ok(msg) => eprintln!("bloch: {}", msg),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
         }
         return;
     }
+
+    // Todo subcommand: handle and exit early
+    if let Some(Command::Todo { root, op }) = &args.command {
+        let root = root.canonicalize().unwrap_or(root.clone());
+        match op {
+            TodoOp::Add { text } => match todo_add(&root, text) {
+                Ok(id) => eprintln!("bloch: todo #{} added", id),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            TodoOp::List => {
+                let items = todo_list(&root);
+                if items.is_empty() {
+                    println!("(no todos)");
+                } else {
+                    for it in items {
+                        println!(
+                            "#{} [{}] {}",
+                            it.id,
+                            if it.done { "x" } else { " " },
+                            it.text
+                        );
+                    }
+                }
+            }
+            TodoOp::Done { id } => match todo_done(&root, *id) {
+                Ok(()) => eprintln!("bloch: todo #{} done", id),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            TodoOp::Drop { id } => match todo_drop(&root, *id) {
+                Ok(()) => eprintln!("bloch: todo #{} dropped", id),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+        }
+        return;
+    }
+
+    // Git subcommand: handle and exit early
+    if let Some(Command::Git { root, op }) = &args.command {
+        let root = root.canonicalize().unwrap_or(root.clone());
+        match op {
+            GitOp::Status => {
+                let (ahead, behind) = git_ahead_behind(&root);
+                let branch = bloch::run_git(&root, &["branch", "--show-current"]);
+                if !branch.is_empty() {
+                    println!("branch: {}", branch);
+                }
+                if ahead > 0 || behind > 0 {
+                    println!("ahead {}, behind {}", ahead, behind);
+                }
+                print!("{}", get_session_state(&root));
+            }
+            GitOp::Wip => {
+                print!("{}", git_wip_detail(&root));
+            }
+        }
+        return;
+    }
+
     let root_arg = args.root.clone().unwrap_or_else(|| {
         eprintln!("bloch: error: <ROOT> is required when not using a subcommand");
         std::process::exit(2);

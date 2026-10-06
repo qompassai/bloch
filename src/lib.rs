@@ -511,7 +511,7 @@ pub fn run_git(root: &Path, args: &[&str]) -> String {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy_owned(o.stdout).trim().to_string())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
 }
 
@@ -2899,8 +2899,413 @@ pub fn map_repo(root: &Path, config: &MapConfig) -> Result<RepoMap> {
     })
 }
 
+/// Maximum characters for a single memory file read (bounded).
+const MEMORY_READ_BUDGET: usize = 8000;
+
+/// Read INDEX.md and current.md from .ai/memory/ in one bounded call.
+/// Returns empty string if .ai/memory/ does not exist.
+/// Contract: never reads more than MEMORY_READ_BUDGET chars per file.
+pub fn memory_read(root: &Path) -> String {
+    let mem_dir = root.join(".ai").join("memory");
+    if !mem_dir.is_dir() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for name in ["INDEX.md", "current.md"] {
+        let path = mem_dir.join(name);
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let truncated: String = content.chars().take(MEMORY_READ_BUDGET).collect();
+                out.push_str(&format!("## {}\n{}\n\n", name, truncated));
+                if content.chars().count() > MEMORY_READ_BUDGET {
+                    out.push_str("(truncated)\n\n");
+                }
+            }
+            Err(_) => {
+                out.push_str(&format!("## {} (missing)\n\n", name));
+            }
+        }
+    }
+    out
+}
+
+/// Write a timestamped inbox entry to .ai/memory/inbox/.
+/// File name: <epoch>-<agent>-<topic>.md (sanitized).
+/// Returns the created file name on success.
+/// Contract: topic sanitized to [a-z0-9-]; agent defaults to "agent".
+pub fn memory_inbox(root: &Path, agent: &str, topic: &str, content: &str) -> Result<String> {
+    let inbox_dir = root.join(".ai").join("memory").join("inbox");
+    std::fs::create_dir_all(&inbox_dir)?;
+
+    let safe_topic: String = topic
+        .to_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let safe_topic = if safe_topic.is_empty() {
+        "note"
+    } else {
+        &safe_topic
+    };
+    let safe_agent: String = agent
+        .to_lowercase()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '-')
+        .collect();
+    let safe_agent = if safe_agent.is_empty() {
+        "agent"
+    } else {
+        &safe_agent
+    };
+
+    let epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let fname = format!("{}-{}-{}.md", epoch, safe_agent, safe_topic);
+    let path = inbox_dir.join(&fname);
+    std::fs::write(&path, content)?;
+    Ok(fname)
+}
+
+/// Promote an inbox entry to a curated memory file.
+/// Appends inbox/<file> content to .ai/memory/<target>, then moves the
+/// inbox file to .ai/memory/archive/.
+/// Contract: target must be decisions.md, patterns.md, or current.md.
+/// Rejects path traversal in file name.
+pub fn memory_promote(root: &Path, file: &str, target: &str) -> Result<String> {
+    const ALLOWED: &[&str] = &["decisions.md", "patterns.md", "current.md"];
+    if !ALLOWED.contains(&target) {
+        return Err(BlochError::GitFailed(format!(
+            "invalid target '{}': must be one of {}",
+            target,
+            ALLOWED.join(", ")
+        )));
+    }
+    if file.contains('/') || file.contains('\\') || file.starts_with('.') {
+        return Err(BlochError::InvalidPath(format!(
+            "invalid inbox file name '{}'",
+            file
+        )));
+    }
+    let mem_dir = root.join(".ai").join("memory");
+    let src = mem_dir.join("inbox").join(file);
+    let content = std::fs::read_to_string(&src)?;
+
+    let dest = mem_dir.join(target);
+    let existing = std::fs::read_to_string(&dest).unwrap_or_default();
+    let merged = if existing.is_empty() {
+        content.clone()
+    } else {
+        format!("{}\n\n---\n\n{}", existing.trim_end(), content.trim())
+    };
+    std::fs::write(&dest, merged)?;
+
+    let archive_dir = mem_dir.join("archive");
+    std::fs::create_dir_all(&archive_dir)?;
+    std::fs::rename(&src, archive_dir.join(file))?;
+    Ok(format!("promoted {} -> {}", file, target))
+}
+
+/// A single todo item. IDs are 1-based positional.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TodoItem {
+    pub id: usize,
+    pub text: String,
+    pub done: bool,
+}
+
+/// Parse .ai/todo.md into items. Format: `- [ ] text` / `- [x] text`.
+/// Non-matching lines are ignored.
+pub fn todo_parse(content: &str) -> Vec<TodoItem> {
+    content
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("- [ ] ") {
+                Some((false, rest))
+            } else if let Some(rest) = t.strip_prefix("- [x] ") {
+                Some((true, rest))
+            } else {
+                None
+            }
+        })
+        .enumerate()
+        .map(|(i, (done, text))| TodoItem {
+            id: i + 1,
+            text: text.to_string(),
+            done,
+        })
+        .collect()
+}
+
+/// Render todo items to .ai/todo.md format.
+pub fn todo_render(items: &[TodoItem]) -> String {
+    let mut out: String = items
+        .iter()
+        .map(|it| format!("- [{}] {}", if it.done { "x" } else { " " }, it.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    out
+}
+
+fn todo_path(root: &Path) -> std::path::PathBuf {
+    root.join(".ai").join("todo.md")
+}
+
+fn todo_load(root: &Path) -> Vec<TodoItem> {
+    std::fs::read_to_string(todo_path(root))
+        .map(|c| todo_parse(&c))
+        .unwrap_or_default()
+}
+
+fn todo_save(root: &Path, items: &[TodoItem]) -> Result<()> {
+    let path = todo_path(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, todo_render(items))?;
+    Ok(())
+}
+
+/// Add a todo item. Returns the new item's ID.
+pub fn todo_add(root: &Path, text: &str) -> Result<usize> {
+    let mut items = todo_load(root);
+    let id = items.len() + 1;
+    items.push(TodoItem {
+        id,
+        text: text.to_string(),
+        done: false,
+    });
+    todo_save(root, &items)?;
+    Ok(id)
+}
+
+/// List all todo items.
+pub fn todo_list(root: &Path) -> Vec<TodoItem> {
+    todo_load(root)
+}
+
+/// Mark a todo item done. Errors if the ID does not exist.
+pub fn todo_done(root: &Path, id: usize) -> Result<()> {
+    let mut items = todo_load(root);
+    let item = items
+        .iter_mut()
+        .find(|it| it.id == id)
+        .ok_or_else(|| BlochError::GitFailed(format!("no todo with id {}", id)))?;
+    item.done = true;
+    todo_save(root, &items)
+}
+
+/// Remove a todo item and renumber the rest (IDs stay dense, positional).
+pub fn todo_drop(root: &Path, id: usize) -> Result<()> {
+    let mut items = todo_load(root);
+    let pos = items
+        .iter()
+        .position(|it| it.id == id)
+        .ok_or_else(|| BlochError::GitFailed(format!("no todo with id {}", id)))?;
+    items.remove(pos);
+    for (i, it) in items.iter_mut().enumerate() {
+        it.id = i + 1;
+    }
+    todo_save(root, &items)
+}
+
+/// Ahead/behind counts vs the upstream tracking branch.
+/// Returns (0, 0) if no upstream or not a git repo.
+pub fn git_ahead_behind(root: &Path) -> (usize, usize) {
+    let out = run_git(
+        root,
+        &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+    );
+    let mut parts = out.split_whitespace();
+    let ahead = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let behind = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (ahead, behind)
+}
+
+/// Detailed WIP: per-file diff stats for uncommitted changes.
+/// Bounded to 30 stat lines per section, 20 untracked files.
+pub fn git_wip_detail(root: &Path) -> String {
+    let mut lines = vec!["## wip detail".to_string()];
+    let stat = run_git(root, &["diff", "--stat", "--", "."]);
+    if !stat.is_empty() {
+        lines.push("unstaged:".to_string());
+        for l in stat.lines().take(30) {
+            lines.push(format!("  {}", l));
+        }
+    }
+    let stat_cached = run_git(root, &["diff", "--cached", "--stat", "--", "."]);
+    if !stat_cached.is_empty() {
+        lines.push("staged:".to_string());
+        for l in stat_cached.lines().take(30) {
+            lines.push(format!("  {}", l));
+        }
+    }
+    let untracked = run_git(root, &["ls-files", "--others", "--exclude-standard"]);
+    let untracked: Vec<&str> = untracked.lines().filter(|l| !l.is_empty()).collect();
+    if !untracked.is_empty() {
+        lines.push(format!("untracked ({}):", untracked.len()));
+        for l in untracked.iter().take(20) {
+            lines.push(format!("  {}", l));
+        }
+        if untracked.len() > 20 {
+            lines.push(format!("  ... and {} more", untracked.len() - 20));
+        }
+    }
+    if lines.len() == 1 {
+        lines.push("tree: clean".to_string());
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::fs;
+
+    fn tmp_root(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bloch-test-{}-{}", name, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn todo_parse_roundtrip() {
+        let text = "- [ ] write tests\n- [x] fix bug\nnot a todo\n- [ ] ship it\n";
+        let items = todo_parse(text);
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].id, 1);
+        assert!(!items[0].done);
+        assert_eq!(items[0].text, "write tests");
+        assert!(items[1].done);
+        assert_eq!(items[2].id, 3);
+        let rendered = todo_render(&items);
+        assert_eq!(
+            rendered,
+            "- [ ] write tests\n- [x] fix bug\n- [ ] ship it\n"
+        );
+    }
+
+    #[test]
+    fn todo_crud() {
+        let root = tmp_root("todo");
+        let id1 = todo_add(&root, "first task").unwrap();
+        let id2 = todo_add(&root, "second task").unwrap();
+        assert_eq!(id1, 1);
+        assert_eq!(id2, 2);
+
+        let items = todo_list(&root);
+        assert_eq!(items.len(), 2);
+
+        todo_done(&root, 1).unwrap();
+        let items = todo_list(&root);
+        assert!(items[0].done);
+        assert!(!items[1].done);
+
+        assert!(todo_done(&root, 99).is_err());
+
+        todo_drop(&root, 1).unwrap();
+        let items = todo_list(&root);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, 1); // renumbered
+        assert_eq!(items[0].text, "second task");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_inbox_sanitizes_names() {
+        let root = tmp_root("inbox");
+        let fname = memory_inbox(&root, "Test Agent!", "My Topic: Here?", "content").unwrap();
+        assert!(
+            fname.ends_with("-testagent-my-topic-here.md"),
+            "got {}",
+            fname
+        );
+        assert!(!fname.contains(' '));
+        assert!(!fname.contains(':'));
+        assert!(!fname.contains('?'));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_inbox_empty_topic_defaults() {
+        let root = tmp_root("inbox2");
+        let fname = memory_inbox(&root, "", "!!!", "content").unwrap();
+        assert!(fname.contains("-agent-note.md"), "got {}", fname);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_promote_moves_to_archive() {
+        let root = tmp_root("promote");
+        let mem_dir = root.join(".ai").join("memory");
+        fs::create_dir_all(mem_dir.join("inbox")).unwrap();
+        fs::write(
+            mem_dir.join("inbox").join("123-agent-test.md"),
+            "new insight",
+        )
+        .unwrap();
+        fs::write(mem_dir.join("decisions.md"), "old decision").unwrap();
+
+        let msg = memory_promote(&root, "123-agent-test.md", "decisions.md").unwrap();
+        assert!(msg.contains("promoted"));
+
+        let decisions = fs::read_to_string(mem_dir.join("decisions.md")).unwrap();
+        assert!(decisions.contains("old decision"));
+        assert!(decisions.contains("new insight"));
+
+        assert!(mem_dir.join("archive").join("123-agent-test.md").exists());
+        assert!(!mem_dir.join("inbox").join("123-agent-test.md").exists());
+
+        // Invalid target rejected
+        assert!(memory_promote(&root, "x.md", "evil.md").is_err());
+        // Path traversal rejected
+        assert!(memory_promote(&root, "../evil.md", "decisions.md").is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_read_bounded() {
+        let root = tmp_root("memread");
+        assert_eq!(memory_read(&root), ""); // no .ai/memory
+
+        let mem_dir = root.join(".ai").join("memory");
+        fs::create_dir_all(&mem_dir).unwrap();
+        fs::write(mem_dir.join("INDEX.md"), "# Index").unwrap();
+        // current.md missing -> marked missing
+        let out = memory_read(&root);
+        assert!(out.contains("## INDEX.md"));
+        assert!(out.contains("# Index"));
+        assert!(out.contains("## current.md (missing)"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_ahead_behind_non_repo_is_zero() {
+        let root = tmp_root("git-nonrepo");
+        assert_eq!(git_ahead_behind(&root), (0, 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_wip_detail_clean_tree() {
+        let root = tmp_root("wip");
+        // Not a git repo: run_git returns empty, tree reports clean
+        let out = git_wip_detail(&root);
+        assert!(out.contains("tree: clean"), "got {}", out);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     use super::*;
 
     #[test]

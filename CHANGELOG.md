@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `bloch memory read`: bounded session-start read of INDEX.md + current.md
+- `bloch memory inbox`: timestamped inbox entries (`<epoch>-<agent>-<topic>.md`)
+- `bloch memory promote`: inbox -> curated file (decisions/patterns/current) + archive
+- `bloch todo`: add/list/done/drop on `.ai/todo.md`
+- `bloch git status`: branch + ahead/behind + session state for agents
+- `bloch git wip`: per-file diff stats for uncommitted changes
 - Initial release as `bloch` (renamed from `repomap`)
 - Ranked, budgeted codebase maps for coding agents
 - Probability normalization: `p(d) = max(score(d), 0) / Σ max(score(d′), 0)`

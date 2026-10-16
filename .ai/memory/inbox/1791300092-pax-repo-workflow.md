@@ -1,0 +1,1 @@
+Standing workflow 2026-10-06: validate in ~/workspace/, mirror against ~/.GH/Qompass/<repo>, then commit. Update .ai/memory via bloch for each repo touched.

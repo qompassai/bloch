@@ -1,0 +1,16 @@
+[book]
+title = "bloch"
+authors = ["Matt Porter"]
+language = "en"
+src = "docs"
+
+[output.html]
+theme = "docs/theme"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+site-url = ""
+git-repository-url = "https://github.com/qompassai/bloch"
+
+[output.html.fold]
+enable = true
+level = 1

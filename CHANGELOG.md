@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `bloch memory promote`: inbox -> curated file (decisions/patterns/current) + archive
 - `bloch todo`: add/list/done/drop on `.ai/todo.md`
 - `bloch git status`: branch + ahead/behind + session state for agents
+- `bloch todo sync`: scan repo for TODO/FIXME/HACK/XXX/BUG markers, add new
+  ones as todos, mark resolved ones done (manual todos untouched)
 - `bloch git wip`: per-file diff stats for uncommitted changes
 - Initial release as `bloch` (renamed from `repomap`)
 - Ranked, budgeted codebase maps for coding agents

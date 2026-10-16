@@ -3,8 +3,8 @@ use bloch::{
     detect_skills, diff_maps, get_file_recency_boost, get_file_why, get_memory_context,
     get_session_state, get_test_status, git_ahead_behind, git_wip_detail, map_repo, memory_inbox,
     memory_promote, memory_read, read_memory_cache, render_sphere, skill_boost, todo_add,
-    todo_done, todo_drop, todo_list, write_memory_cache, write_memory_summary, CachedMap,
-    Definition, MapConfig, RefKey, RefKind,
+    todo_done, todo_drop, todo_list, todo_sync, write_memory_cache, write_memory_summary,
+    CachedMap, Definition, MapConfig, RefKey, RefKind,
 };
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
@@ -99,6 +99,12 @@ enum TodoOp {
         /// Item ID
         id: usize,
     },
+    /// Scan repo for TODO/FIXME markers and reconcile with todo list
+    Sync {
+        /// Show what would change without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -157,7 +163,6 @@ enum MemoryOp {
 fn main() {
     let args = Args::parse();
 
-    // Skill-aware ranking: detect active skills and boost matching languages
     let detect_root = args.root.clone().unwrap_or(PathBuf::from("."));
     let active_skills: Vec<String> = if args.no_skill_boost {
         Vec::new()
@@ -170,7 +175,6 @@ fn main() {
         eprintln!("bloch: active skills: {}", active_skills.join(", "));
     }
 
-    // Memory subcommand: handle and exit early (does not need map root)
     if let Some(Command::Memory { root, op }) = &args.command {
         let root = root.canonicalize().unwrap_or(root.clone());
         let mem_dir = root.join(".ai").join("memory");
@@ -267,7 +271,6 @@ fn main() {
         return;
     }
 
-    // Todo subcommand: handle and exit early
     if let Some(Command::Todo { root, op }) = &args.command {
         let root = root.canonicalize().unwrap_or(root.clone());
         match op {
@@ -307,11 +310,32 @@ fn main() {
                     std::process::exit(1);
                 }
             },
+            TodoOp::Sync { dry_run } => {
+                if *dry_run {
+                    let markers = bloch::todo_scan(&root);
+                    println!("markers found: {}", markers.len());
+                    for m in markers.iter().take(20) {
+                        println!("  {}:{} {}: {}", m.file, m.line, m.kind, m.text);
+                    }
+                    if markers.len() > 20 {
+                        println!("  ... and {} more", markers.len() - 20);
+                    }
+                } else {
+                    match todo_sync(&root) {
+                        Ok((added, completed)) => {
+                            eprintln!("bloch: sync: {} added, {} completed", added, completed)
+                        }
+                        Err(e) => {
+                            eprintln!("bloch: error: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
         }
         return;
     }
 
-    // Git subcommand: handle and exit early
     if let Some(Command::Git { root, op }) = &args.command {
         let root = root.canonicalize().unwrap_or(root.clone());
         match op {
@@ -339,7 +363,6 @@ fn main() {
     });
     let root = root_arg.canonicalize().unwrap_or(root_arg.clone());
 
-    // Use the public API for mapping (was duplicated logic)
     let config = MapConfig {
         use_scip: args.scip,
     };
@@ -356,7 +379,6 @@ fn main() {
     let per_file = repo_map.files;
     let files: Vec<PathBuf> = per_file.keys().map(|rel| root.join(rel)).collect();
 
-    // Aggregate reference index (Rust only)
     let mut name_df: HashMap<String, usize> = HashMap::new();
     for data in per_file.values() {
         if data.lang == "rust" {
@@ -374,7 +396,6 @@ fn main() {
             .sum()
     };
 
-    // Rank definitions
     let mut ranked: Vec<(f64, bool, String, Definition)> = Vec::new();
     for (rel, data) in &per_file {
         if data.lang != "rust" {
@@ -426,9 +447,9 @@ fn main() {
                 }
                 _ => refs_outside(rel, RefKind::Ident, &RefKey::Single(d.name.clone())) as f64 / df,
             };
-            // Recency boost for handoff fidelity
+
             let boost = get_file_recency_boost(&root, rel, 2.0);
-            // Skill boost: 1.5x for languages matching active skills
+
             let sboost = skill_boost(&data.lang, &active_skills);
             ranked.push((score * boost * sboost, d.is_pub, rel.clone(), d.clone()));
         }
@@ -440,10 +461,6 @@ fn main() {
             .then(b.1.cmp(&a.1))
     });
 
-    // Bloch normalization: convert raw scores to a probability distribution.
-    // Like the Bloch vector constraint |r| = 1, the probabilities sum to 1.0.
-    // P(d) = score(d) / Σ score(d') — the probability that definition d is
-    // "where to look", analogous to quantum measurement probabilities.
     let total_score: f64 = ranked.iter().map(|(s, _, _, _)| s.max(0.0)).sum();
     let ranked_probs: Vec<(f64, f64, bool, String, Definition)> = ranked
         .iter()
@@ -457,7 +474,6 @@ fn main() {
         })
         .collect();
 
-    // Language summary
     let mut lang_counts: HashMap<&str, usize> = HashMap::new();
     for data in per_file.values() {
         *lang_counts.entry(data.lang.as_str()).or_insert(0) += 1;
@@ -478,7 +494,6 @@ fn main() {
 
     let mut lines: Vec<String> = Vec::new();
 
-    // Handoff section first
     let session = get_session_state(&root);
     let memory = get_memory_context(&root, 3000);
     let test_status = get_test_status(&root, 800);
@@ -552,7 +567,6 @@ fn main() {
         emitted.insert(rel.clone());
     }
 
-    // Non-Rust highlights
     lines.push(String::new());
     lines.push("# non-rust structure:".to_string());
     let mut sorted_rels: Vec<&String> = per_file.keys().collect();
@@ -586,15 +600,10 @@ fn main() {
         ));
     }
 
-    // Diff mode: compare against cached map and output only changes
     if args.diff {
-        // Build current state as CachedMap
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| {
-                // Simple ISO-ish format from epoch seconds
-                format!("{}", d.as_secs())
-            })
+            .map(|d| format!("{}", d.as_secs()))
             .unwrap_or_default();
         let git_head = bloch::run_git(&root, &["rev-parse", "HEAD"]);
         let mut files_map = HashMap::new();
@@ -641,7 +650,6 @@ fn main() {
         return;
     }
 
-    // Bloch sphere visualization (if requested)
     if args.sphere {
         let mut recency_map = HashMap::new();
         let mut visibility_map = HashMap::new();
@@ -650,8 +658,7 @@ fn main() {
             let boost = get_file_recency_boost(&root, rel, 2.0);
             let rec_norm = ((boost - 1.0) / 1.0).clamp(0.0, 1.0);
             recency_map.insert(key.clone(), rec_norm);
-            // Visibility (public=1.0, private=0.0) is independent of score,
-            // unlike the old centrality which was just normalized score
+
             visibility_map.insert(key, if d.is_pub { 1.0 } else { 0.0 });
         }
         let sphere = render_sphere(
@@ -671,7 +678,6 @@ fn main() {
         fs::write(&args.out, &out).expect("write output");
     }
 
-    // Update memory: write summary and cache
     if args.update_memory {
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

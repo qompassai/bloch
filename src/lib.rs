@@ -63,10 +63,6 @@ pub enum BlochError {
 /// Result type for bloch operations.
 pub type Result<T> = std::result::Result<T, BlochError>;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -90,12 +86,8 @@ const SKIP_EXTS: &[&str] = &[
     ".sqlite", ".sqlite3",
 ];
 
-const MAX_FILE_SIZE: u64 = 1024 * 1024; // 1MB
+const MAX_FILE_SIZE: u64 = 1024 * 1024;
 const SIG_TRUNC: usize = 220;
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Definition {
@@ -176,7 +168,6 @@ pub struct CachedMap {
 /// Get the memory directory, validating that root doesn't contain path traversal.
 /// Returns an error if the canonicalized path would escape the intended location.
 fn memory_dir(root: &std::path::Path) -> Result<std::path::PathBuf> {
-    // Reject roots with parent directory components to prevent traversal
     for component in root.components() {
         if matches!(component, std::path::Component::ParentDir) {
             return Err(BlochError::InvalidPath(
@@ -186,7 +177,7 @@ fn memory_dir(root: &std::path::Path) -> Result<std::path::PathBuf> {
     }
     let mem_dir = root.join(".ai").join("memory");
     std::fs::create_dir_all(&mem_dir)?;
-    // Verify the created dir is where we expect (no symlink trickery)
+
     let canonical = mem_dir.canonicalize().map_err(BlochError::Io)?;
     let root_canonical = root.canonicalize().map_err(BlochError::Io)?;
     if !canonical.starts_with(&root_canonical) {
@@ -270,10 +261,10 @@ pub fn write_memory_summary(
             "",
             prob
         ));
-        // Fix the format - we want rel, kind, name
+
         let _ = (rel, name, kind);
     }
-    // Rewrite the top defs section properly
+
     let mut top_section = String::from(
         "
 ## Top definitions by probability
@@ -291,7 +282,7 @@ pub fn write_memory_summary(
             prob
         ));
     }
-    // Replace the broken section
+
     if let Some(idx) = out.find(
         "
 ## Top definitions by probability
@@ -354,7 +345,6 @@ pub fn diff_maps(old: &CachedMap, new: &CachedMap) -> String {
         new.timestamp, new.git_head
     ));
 
-    // New files
     let old_files: std::collections::HashSet<&String> = old.files.keys().collect();
     let new_files: std::collections::HashSet<&String> = new.files.keys().collect();
     let added: Vec<&&String> = new_files.difference(&old_files).collect();
@@ -412,7 +402,6 @@ pub fn diff_maps(old: &CachedMap, new: &CachedMap) -> String {
         out.push('\n');
     }
 
-    // Definition changes in common files
     let mut def_changes = Vec::new();
     for (path, new_defs) in &new.files {
         if let Some(old_defs) = old.files.get(path) {
@@ -451,7 +440,6 @@ pub fn diff_maps(old: &CachedMap, new: &CachedMap) -> String {
         out.push('\n');
     }
 
-    // Probability shifts (top defs that moved significantly)
     let old_probs: std::collections::HashMap<String, f64> = old
         .top_defs
         .iter()
@@ -463,7 +451,6 @@ pub fn diff_maps(old: &CachedMap, new: &CachedMap) -> String {
         if let Some(old_p) = old_probs.get(&key) {
             let delta = new_p - old_p;
             if delta.abs() > 0.02 {
-                // Significant shift (>2% probability change)
                 shifts.push((
                     delta,
                     format!("{} `{}::{}` {:.3} → {:.3}", kind, rel, name, old_p, new_p),
@@ -498,10 +485,6 @@ pub fn diff_maps(old: &CachedMap, new: &CachedMap) -> String {
 
     out
 }
-
-// ---------------------------------------------------------------------------
-// Git helpers (handoff fidelity)
-// ---------------------------------------------------------------------------
 
 pub fn run_git(root: &Path, args: &[&str]) -> String {
     Command::new("git")
@@ -568,7 +551,6 @@ pub fn get_memory_context(root: &Path, budget: usize) -> String {
     let mut lines = vec!["## memory (from .ai/memory/)".to_string()];
     let mut used: usize = lines.iter().map(|l| l.len() + 1).sum();
 
-    // Priority order: handoff first
     let priority = ["handoff.md", "active.md", "patterns.md", "decisions.md"];
     let mut ordered: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -710,10 +692,6 @@ pub fn get_file_why(root: &Path, rel: &str, max_chars: usize) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// File walking
-// ---------------------------------------------------------------------------
-
 fn is_text_file(path: &Path) -> bool {
     use std::io::Read;
     let mut fh = match fs::File::open(path) {
@@ -737,7 +715,6 @@ pub fn iter_all_files(root: &Path) -> Vec<PathBuf> {
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
             if e.file_type().is_dir() {
-                // Skip hidden dirs and build dirs
                 if name.starts_with('.') {
                     return false;
                 }
@@ -756,18 +733,16 @@ pub fn iter_all_files(root: &Path) -> Vec<PathBuf> {
             None => continue,
         };
 
-        // Skip hidden files (except allowlisted)
         if name.starts_with('.') && name != ".env.example" {
             if name == ".DS_Store" || name == ".gitkeep" {
                 continue;
             }
-            // Allow .gitignore etc but skip most dotfiles
+
             if ![".gitignore", ".bloch.txt"].contains(&name.as_ref()) {
                 continue;
             }
         }
 
-        // Skip binary extensions
         if let Some(ext) = path.extension() {
             let ext = format!(".{}", ext.to_string_lossy().to_lowercase());
             if SKIP_EXTS.contains(&ext.as_str()) {
@@ -775,7 +750,6 @@ pub fn iter_all_files(root: &Path) -> Vec<PathBuf> {
             }
         }
 
-        // Skip large files
         if let Ok(meta) = fs::metadata(path) {
             if meta.len() > MAX_FILE_SIZE {
                 continue;
@@ -790,10 +764,6 @@ pub fn iter_all_files(root: &Path) -> Vec<PathBuf> {
     out.sort();
     out
 }
-
-// ---------------------------------------------------------------------------
-// Tree-sitter helpers (Rust)
-// ---------------------------------------------------------------------------
 
 fn node_text<'a>(node: &Node, src: &'a [u8]) -> &'a str {
     node.utf8_text(src).unwrap_or("")
@@ -899,7 +869,6 @@ fn extract_rust(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     let mut defs = Vec::new();
     let mut refs = Refs::default();
 
-    // Visit definitions
     fn visit_def(node: &Node, src: &[u8], in_impl: Option<String>, defs: &mut Vec<Definition>) {
         let kind = node.kind();
         match kind {
@@ -937,7 +906,6 @@ fn extract_rust(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
         }
     }
 
-    // Visit references
     fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
         match node.kind() {
             "call_expression" => {
@@ -1005,11 +973,6 @@ fn extract_rust(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     Ok((defs, refs))
 }
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Lua extractor (tree-sitter)
-// ---------------------------------------------------------------------------
-
 fn extract_lua(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     let mut parser = TsParser::new();
     let lang = tree_sitter::Language::new(tree_sitter_lua::LANGUAGE);
@@ -1044,7 +1007,6 @@ fn extract_lua(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "variable_declaration" => {
-                // local x = function() ... end
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     if child.kind() == "assignment_statement" {
@@ -1076,7 +1038,6 @@ fn extract_lua(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "assignment_statement" => {
-                // M.foo = function() ... end  (module-level)
                 let mut cursor = node.walk();
                 let kids: Vec<Node> = node.children(&mut cursor).collect();
                 if kids.len() >= 2 && kids[1].kind() == "function_definition" {
@@ -1104,7 +1065,7 @@ fn extract_lua(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
             "function_call" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = name_text(&name_node, src);
-                    // require("...") is an import
+
                     if name == "require" {
                         if let Some(args) = node.child_by_field_name("arguments") {
                             let mut ac = args.walk();
@@ -1139,10 +1100,6 @@ fn extract_lua(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     visit_ref(&tree.root_node(), src, &mut refs);
     Ok((defs, refs))
 }
-
-// ---------------------------------------------------------------------------
-// Python extractor (tree-sitter)
-// ---------------------------------------------------------------------------
 
 fn extract_python(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     let mut parser = TsParser::new();
@@ -1188,7 +1145,7 @@ fn extract_python(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                         impl_target: None,
                         lang: "python".to_string(),
                     });
-                    // Visit methods with class context
+
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
                         visit_def(&child, src, Some(name.clone()), defs);
@@ -1203,7 +1160,6 @@ fn extract_python(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "assignment" => {
-                // x = ... or x: int = ...
                 if let Some(left) = node.child_by_field_name("left") {
                     if left.kind() == "identifier" {
                         let name = name_text(&left, src);
@@ -1282,10 +1238,6 @@ fn extract_python(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     Ok((defs, refs))
 }
 
-// ---------------------------------------------------------------------------
-// Nix extractor (tree-sitter)
-// ---------------------------------------------------------------------------
-
 fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     let mut parser = TsParser::new();
     let lang = tree_sitter::Language::new(tree_sitter_nix::LANGUAGE);
@@ -1304,7 +1256,6 @@ fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
         node_text(node, src).to_string()
     }
 
-    // Join dotted attrpath: a.b.c
     fn attrpath_text(node: &Node, src: &[u8]) -> String {
         let mut parts = Vec::new();
         let mut cursor = node.walk();
@@ -1322,7 +1273,6 @@ fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 if let Some(attrpath) = node.child_by_field_name("attrpath") {
                     let name = attrpath_text(&attrpath, src);
                     if !name.is_empty() && name != "inherit" {
-                        // Check if value is a function
                         let is_func = node
                             .child_by_field_name("expression")
                             .map(|e| e.kind() == "function_expression")
@@ -1343,7 +1293,6 @@ fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "function_expression" => {
-                // Anonymous function or formal params - capture formals as signature hint
                 if let Some(formals) = node.child_by_field_name("formals") {
                     let mut params = Vec::new();
                     let mut cursor = formals.walk();
@@ -1353,10 +1302,6 @@ fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                                 params.push(name_text(&name_node, src));
                             }
                         }
-                    }
-                    if !params.is_empty() {
-                        // This is a standalone function definition worth noting
-                        // (usually bound to a name via binding, but capture anyway)
                     }
                 }
             }
@@ -1373,17 +1318,13 @@ fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
             "variable_expression" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = name_text(&name_node, src);
-                    // Skip 'import' keyword usage (it's a variable_expression with name "import")
+
                     if name != "import" {
                         *refs.ident_refs.entry(name).or_insert(0) += 1;
-                    } else {
-                        // import ./foo.nix - track as path ref
-                        // The argument is a sibling in apply_expression; handled below
                     }
                 }
             }
             "apply_expression" => {
-                // Check for import calls: import ./path
                 if let Some(func) = node.child_by_field_name("function") {
                     if func.kind() == "variable_expression" {
                         if let Some(name_node) = func.child_by_field_name("name") {
@@ -1400,7 +1341,6 @@ fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "select_expression" => {
-                // a.b.c - track attrpath references
                 if let Some(attrpath) = node.child_by_field_name("attrpath") {
                     let name = attrpath_text(&attrpath, src);
                     if !name.is_empty() {
@@ -1420,10 +1360,6 @@ fn extract_nix(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     visit_ref(&tree.root_node(), src, &mut refs);
     Ok((defs, refs))
 }
-
-// ---------------------------------------------------------------------------
-// Markdown extractor (tree-sitter-md, block grammar)
-// ---------------------------------------------------------------------------
 
 fn extract_markdown_ts(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     let mut parser = TsParser::new();
@@ -1446,13 +1382,11 @@ fn extract_markdown_ts(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     fn visit(node: &Node, src: &[u8], defs: &mut Vec<Definition>) {
         match node.kind() {
             "atx_heading" => {
-                // Level from marker: atx_h1_marker ... atx_h6_marker
                 let mut level = 0;
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     let k = child.kind();
                     if k.starts_with("atx_h") && k.ends_with("_marker") {
-                        // Extract digit: "atx_h2_marker" -> 2
                         if let Some(d) = k.chars().nth(5) {
                             level = d.to_digit(10).unwrap_or(0) as usize;
                         }
@@ -1475,7 +1409,6 @@ fn extract_markdown_ts(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "setext_heading" => {
-                // Level from underline: setext_h1_underline (===) vs setext_h2_underline (---)
                 let mut level = 2;
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
@@ -1498,7 +1431,6 @@ fn extract_markdown_ts(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "fenced_code_block" => {
-                // Find language from info_string -> language child
                 let mut lang_tag = String::new();
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
@@ -1537,11 +1469,6 @@ fn extract_markdown_ts(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     Ok((defs, refs))
 }
 
-// Kotlin extractor (tree-sitter) - using tree-sitter-kotlin-ng 1.1.0
-// ---------------------------------------------------------------------------
-// Kotlin extractor (tree-sitter)
-// ---------------------------------------------------------------------------
-
 fn extract_kotlin(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     let mut parser = TsParser::new();
     let lang = tree_sitter_kotlin_ng::LANGUAGE.into();
@@ -1560,11 +1487,9 @@ fn extract_kotlin(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
         node_text(node, src).to_string()
     }
 
-    // First direct child of given type
     fn first_child_of<'a>(node: &Node<'a>, kind: &str) -> Option<Node<'a>> {
         let mut cursor = node.walk();
-        // Named binding (not a chained temporary) so the iterator drops
-        // before cursor, satisfying the borrow checker.
+
         let mut children = node.children(&mut cursor);
         children.find(|child| child.kind() == kind)
     }
@@ -1577,7 +1502,7 @@ fn extract_kotlin(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                     defs.push(Definition {
                         name: name.clone(),
                         kind: "function".to_string(),
-                        is_pub: true, // visibility modifier check would be more precise
+                        is_pub: true,
                         sig: format!("fun {}", name),
                         impl_target: None,
                         lang: "kotlin".to_string(),
@@ -1657,20 +1582,18 @@ fn extract_kotlin(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     fn visit_ref(node: &Node, src: &[u8], refs: &mut Refs) {
         match node.kind() {
             "call_expression" => {
-                // Function name is typically first identifier child
                 if let Some(name_node) = first_child_of(node, "identifier") {
                     let name = name_text(&name_node, src);
                     *refs.call.entry((name, None)).or_insert(0) += 1;
                 }
             }
             "navigation_expression" => {
-                // a.b.c - track the full chain
                 let text = name_text(node, src);
                 *refs.ident_refs.entry(text).or_insert(0) += 1;
             }
             "identifier" => {
                 let name = name_text(node, src);
-                // Skip keywords
+
                 if ![
                     "val", "var", "fun", "class", "object", "if", "else", "when", "for", "while",
                     "return",
@@ -1692,10 +1615,6 @@ fn extract_kotlin(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     visit_ref(&tree.root_node(), src, &mut refs);
     Ok((defs, refs))
 }
-
-// ---------------------------------------------------------------------------
-// Bash extractor (tree-sitter)
-// ---------------------------------------------------------------------------
 
 fn extract_bash(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     let mut parser = TsParser::new();
@@ -1744,12 +1663,10 @@ fn extract_bash(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "declaration_command" => {
-                // local, export, declare, readonly
                 let text = name_text(node, src);
-                // Extract variable name (first word after command)
+
                 let parts: Vec<&str> = text.split_whitespace().collect();
                 if parts.len() >= 2 {
-                    // Skip flags like -r, -a
                     for part in &parts[1..] {
                         if !part.starts_with('-') && part.contains('=') {
                             if let Some(name) = part.split('=').next() {
@@ -1790,9 +1707,8 @@ fn extract_bash(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
             "command" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = name_text(&name_node, src);
-                    // Skip source/. as they are imports
+
                     if name == "source" || name == "." {
-                        // Track sourced file as path ref
                         let mut cursor = node.walk();
                         for child in node.children(&mut cursor) {
                             if child.kind() == "word" || child.kind() == "string" {
@@ -1811,7 +1727,6 @@ fn extract_bash(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
                 }
             }
             "simple_expansion" | "expansion" => {
-                // $VAR or ${VAR}
                 let text = name_text(node, src);
                 let var = text
                     .trim_start_matches('$')
@@ -1837,10 +1752,6 @@ fn extract_bash(src: &[u8]) -> Result<(Vec<Definition>, Refs)> {
     visit_ref(&tree.root_node(), src, &mut refs);
     Ok((defs, refs))
 }
-
-// ---------------------------------------------------------------------------
-// TypeScript extractor (tree-sitter)
-// ---------------------------------------------------------------------------
 
 fn extract_typescript(src: &[u8], is_tsx: bool) -> Result<(Vec<Definition>, Refs)> {
     let mut parser = TsParser::new();
@@ -1948,7 +1859,7 @@ fn extract_typescript(src: &[u8], is_tsx: bool) -> Result<(Vec<Definition>, Refs
             "variable_declarator" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = name_text(&name_node, src);
-                    // Check if value is arrow function or function expression
+
                     let is_func = node
                         .child_by_field_name("value")
                         .map(|v| v.kind() == "arrow_function" || v.kind() == "function_expression")
@@ -2009,7 +1920,6 @@ fn extract_typescript(src: &[u8], is_tsx: bool) -> Result<(Vec<Definition>, Refs
                 }
             }
             "import_statement" => {
-                // import ... from "module"
                 let mut cursor = node.walk();
                 for child in node.children(&mut cursor) {
                     if child.kind() == "string" {
@@ -2039,22 +1949,9 @@ fn extract_typescript(src: &[u8], is_tsx: bool) -> Result<(Vec<Definition>, Refs
     Ok((defs, refs))
 }
 
-// ---------------------------------------------------------------------------
-// SCIP index reader (opt-in via --scip flag)
-// ---------------------------------------------------------------------------
-//
-// Reads existing SCIP indexes (.scip/index.scip) for precise definitions and
-// references. Falls back to tree-sitter when no index exists or it is stale.
-//
-// SCIP (Sourcegraph Code Intelligence Protocol) provides precise code
-// navigation data from real type checking, unlike tree-sitter's heuristic
-// parsing. This is a precision upgrade, not a replacement.
-
 /// Find SCIP index file in repo root.
 /// Checks: .scip/index.scip, index.scip
 fn find_scip_index(root: &Path) -> Option<PathBuf> {
-    // Single candidate name; kept as a named binding so adding future
-    // index filenames is a one-line change.
     let candidate = "index.scip";
     let path = root.join(".scip").join(candidate);
     if path.is_file() {
@@ -2075,8 +1972,6 @@ fn is_scip_stale(index_path: &Path, root: &Path) -> bool {
         Err(_) => return true,
     };
 
-    // Check if any source file is newer than the index
-    // (simple heuristic: check a few common source extensions)
     let extensions = ["rs", "py", "lua", "ts", "tsx", "kt", "sh", "nix", "md"];
     if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
@@ -2092,7 +1987,7 @@ fn is_scip_stale(index_path: &Path, root: &Path) -> bool {
                     }
                 }
             }
-            // Recurse one level for common dirs
+
             if path.is_dir() {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if ["src", "lib", "lua", "app"].contains(&name) {
@@ -2125,18 +2020,15 @@ fn is_scip_stale(index_path: &Path, root: &Path) -> bool {
 /// SCIP symbols look like: `rust-analyzer cargo bloch 0.1.0 Args#`, `... main().`
 /// Returns None for package symbols (e.g. `crate/`) which should be skipped.
 fn scip_symbol_parse(symbol: &str) -> Option<(String, String)> {
-    // Take the last space-separated token (the descriptors)
     let descriptors = symbol.split_whitespace().last()?;
 
-    // Skip package symbols like `crate/`
     if descriptors == "crate/" || descriptors.ends_with('/') {
         return None;
     }
 
-    // Function: `main().` -> ("main", "function")
     if descriptors.ends_with("().") {
         let name = descriptors.trim_end_matches("().").to_string();
-        // Handle methods: `Type#method().` -> take after #
+
         let name = if let Some(pos) = name.rfind('#') {
             name[pos + 1..].to_string()
         } else {
@@ -2148,10 +2040,9 @@ fn scip_symbol_parse(symbol: &str) -> Option<(String, String)> {
         return Some((name, "function".to_string()));
     }
 
-    // Type: `Args#` -> ("Args", "type")
     if descriptors.ends_with('#') && !descriptors.contains("().") {
         let name = descriptors.trim_end_matches('#').to_string();
-        // Handle nested: `Outer#Inner#` -> take after last #
+
         let name = if let Some(pos) = name.rfind('#') {
             name[pos + 1..].to_string()
         } else {
@@ -2163,16 +2054,15 @@ fn scip_symbol_parse(symbol: &str) -> Option<(String, String)> {
         return Some((name, "type".to_string()));
     }
 
-    // Field/member: `Args#root.` -> ("root", "field")
     if descriptors.ends_with('.') {
         let without_dot = descriptors.trim_end_matches('.');
-        // Take after # if present (field of a type)
+
         let name = if let Some(pos) = without_dot.rfind('#') {
             without_dot[pos + 1..].to_string()
         } else {
             without_dot.to_string()
         };
-        // Skip if it still contains descriptor chars (malformed)
+
         if name.is_empty() || name.contains('#') || name.contains('(') {
             return None;
         }
@@ -2195,24 +2085,20 @@ fn scip_symbol_name(symbol: &str) -> String {
 pub fn read_scip_index(root: &Path) -> Option<HashMap<String, ScipFileData>> {
     let index_path = find_scip_index(root)?;
 
-    // Check staleness (conservative: fall back to tree-sitter if stale)
     if is_scip_stale(&index_path, root) {
         eprintln!("bloch: SCIP index is stale, falling back to tree-sitter");
         return None;
     }
 
-    // Read and parse the index
     let data = std::fs::read(&index_path).ok()?;
     let index: scip::types::Index = protobuf::Message::parse_from_bytes(&data).ok()?;
 
     let mut per_file: std::collections::HashMap<String, (Vec<Definition>, Refs, String)> =
         std::collections::HashMap::new();
 
-    // Build symbol -> definition info map (global, for cross-file references)
     let mut symbol_defs: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
 
-    // First pass: collect all symbol definitions
     for document in &index.documents {
         for symbol_info in &document.symbols {
             let symbol = symbol_info.symbol.clone();
@@ -2222,7 +2108,6 @@ pub fn read_scip_index(root: &Path) -> Option<HashMap<String, ScipFileData>> {
         }
     }
 
-    // Second pass: build per-file definitions and references
     for document in &index.documents {
         let rel_path = document.relative_path.clone();
 
@@ -2247,7 +2132,6 @@ pub fn read_scip_index(root: &Path) -> Option<HashMap<String, ScipFileData>> {
         let mut defs = Vec::new();
         let mut refs = Refs::default();
 
-        // Definitions from this document's symbols
         for symbol_info in &document.symbols {
             let symbol = symbol_info.symbol.clone();
             if let Some((name, kind)) = symbol_defs.get(&symbol) {
@@ -2262,7 +2146,6 @@ pub fn read_scip_index(root: &Path) -> Option<HashMap<String, ScipFileData>> {
             }
         }
 
-        // References from this document's occurrences
         for occurrence in &document.occurrences {
             let symbol = occurrence.symbol.clone();
             if symbol.is_empty() {
@@ -2293,9 +2176,6 @@ pub fn read_scip_index(root: &Path) -> Option<HashMap<String, ScipFileData>> {
 
     Some(per_file)
 }
-
-// Shallow extractors (non-Rust)
-// ---------------------------------------------------------------------------
 
 fn extract_ruby_fastlane(text: &str) -> Vec<Definition> {
     let lane_re =
@@ -2380,32 +2260,31 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
     let text = String::from_utf8_lossy(&src).to_string();
     let empty = Refs::default();
 
-    // Rust: full tree-sitter
     if ext == ".rs" {
         let (defs, refs) = extract_rust(&src)?;
         return Ok((defs, refs, "rust".to_string()));
     }
-    // Markdown
+
     if [".md", ".markdown", ".mdown"].contains(&ext.as_str()) {
         let (defs, refs) = extract_markdown_ts(&src)?;
         return Ok((defs, refs, "markdown".to_string()));
     }
-    // Nix
+
     if ext == ".nix" {
         let (defs, refs) = extract_nix(&src)?;
         return Ok((defs, refs, "nix".to_string()));
     }
-    // Python
+
     if ext == ".py" || ext == ".pyi" {
         let (defs, refs) = extract_python(&src)?;
         return Ok((defs, refs, "python".to_string()));
     }
-    // Lua
+
     if ext == ".lua" {
         let (defs, refs) = extract_lua(&src)?;
         return Ok((defs, refs, "lua".to_string()));
     }
-    // Ruby / Fastlane
+
     if ext == ".rb"
         || ext == ".rake"
         || [
@@ -2421,7 +2300,7 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
     {
         return Ok((extract_ruby_fastlane(&text), empty, "ruby".to_string()));
     }
-    // Starlark / BUILD
+
     if ["build", "workspace"].contains(&basename.as_str())
         || [".bzl", ".bazel"].contains(&ext.as_str())
     {
@@ -2450,7 +2329,7 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
         }
         return Ok((defs, empty, "starlark".to_string()));
     }
-    // TOML
+
     if ext == ".toml" {
         let re = Regex::new(r"^\[([^\]]+)\]").expect("hardcoded bracket regex");
         let mut defs = Vec::new();
@@ -2478,7 +2357,7 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
         }
         return Ok((defs, empty, "toml".to_string()));
     }
-    // YAML
+
     if ext == ".yaml" || ext == ".yml" {
         let re = Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\-]*)\s*:").expect("hardcoded key regex");
         let mut defs = Vec::new();
@@ -2505,7 +2384,7 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
         }
         return Ok((defs, empty, "yaml".to_string()));
     }
-    // JSON
+
     if ext == ".json" && text.len() < 50000 {
         if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(&text)
         {
@@ -2529,7 +2408,7 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
             "json".to_string(),
         ));
     }
-    // Shell
+
     if [".sh", ".bash", ".zsh"].contains(&ext.as_str())
         || basename.starts_with("run")
         || basename.ends_with(".sh")
@@ -2538,13 +2417,11 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
         return Ok((defs, refs, "bash".to_string()));
     }
 
-    // Kotlin (via tree-sitter-kotlin-ng 1.1.0, compatible with tree-sitter 0.25+)
     if [".kt", ".kts"].contains(&ext.as_str()) {
         let (defs, refs) = extract_kotlin(&src)?;
         return Ok((defs, refs, "kotlin".to_string()));
     }
 
-    // TypeScript / TSX
     if [".ts", ".mts", ".cts"].contains(&ext.as_str()) {
         let (defs, refs) = extract_typescript(&src, false)?;
         return Ok((defs, refs, "typescript".to_string()));
@@ -2554,7 +2431,6 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
         return Ok((defs, refs, "tsx".to_string()));
     }
 
-    // Fallback: generic file info
     let lang = if ext.is_empty() {
         "text"
     } else {
@@ -2583,34 +2459,30 @@ pub fn render_sphere(
 ) -> String {
     const WIDTH: usize = 50;
     const HEIGHT: usize = 25;
-    const R: f64 = 11.0; // sphere radius in character units
+    const R: f64 = 11.0;
 
-    // Take top N by probability
     let points: Vec<(f64, f64, String)> = ranked
         .iter()
         .take(max_points)
         .enumerate()
         .map(|(i, (_score, prob, _pub, rel, d))| {
-            // θ: p=1 → 0 (north pole), p=0 → π (south pole)
             let theta = std::f64::consts::PI * (1.0 - prob.clamp(0.0, 1.0));
-            // φ: from recency (x) and centrality (y), normalized to [0, 2π)
+
             let key = format!("{}::{}", rel, d.name);
             let rec = recency_scores.get(&key).copied().unwrap_or(0.5);
             let vis = visibility_scores.get(&key).copied().unwrap_or(0.5);
             let phi = (vis - 0.5).atan2(rec - 0.5);
-            // Short label: first 8 chars of definition name
+
             let label = format!("{}", (i + 1));
             let _ = label;
             (theta, phi, d.name.chars().take(12).collect::<String>())
         })
         .collect();
 
-    // Build the grid
     let mut grid = vec![vec![' '; WIDTH]; HEIGHT];
     let cx = WIDTH as f64 / 2.0;
     let cy = HEIGHT as f64 / 2.0;
 
-    // Draw sphere outline (circle in xy projection)
     for angle in 0..360 {
         let a = (angle as f64).to_radians();
         let x = (cx + R * 1.8 * a.cos()) as usize;
@@ -2620,40 +2492,34 @@ pub fn render_sphere(
         }
     }
 
-    // Draw axes
-    // Z-axis (vertical, through center)
     for y in 0..HEIGHT {
         let x = cx as usize;
         if x < WIDTH && grid[y][x] == ' ' {
             grid[y][x] = '│';
         }
     }
-    // Equator (horizontal)
+
     let ey = cy as usize;
     for x in 0..WIDTH {
         if grid[ey][x] == ' ' {
             grid[ey][x] = '─';
         }
     }
-    // Center
+
     if (cx as usize) < WIDTH && (cy as usize) < HEIGHT {
         grid[cy as usize][cx as usize] = '┼';
     }
 
-    // Plot points
-    // Project 3D sphere point to 2D: orthographic from front-above
     for (i, (theta, phi, _name)) in points.iter().enumerate() {
         let x3d = theta.sin() * phi.cos();
         let y3d = theta.sin() * phi.sin();
         let z3d = theta.cos();
-        // Simple projection: x → horizontal, blend of y and z → vertical
-        // (viewing from front, slightly above)
+
         let sx = cx + x3d * R * 1.8;
         let sy = cy - (z3d * 0.7 + y3d * 0.3) * R * 0.9;
         let px = sx as usize;
         let py = sy as usize;
         if px < WIDTH && py < HEIGHT {
-            // Use digit for index (1-9, then letters)
             let ch = if i < 9 {
                 (b'1' + i as u8) as char
             } else if i < 35 {
@@ -2665,7 +2531,6 @@ pub fn render_sphere(
         }
     }
 
-    // Build output
     let mut out = String::new();
     out.push_str("# Bloch sphere: top definitions by (relevance, recency, centrality)\n");
     out.push_str("#   +z (north pole) = highest probability — measure here first\n");
@@ -2685,7 +2550,7 @@ pub fn render_sphere(
         } else {
             "*".to_string()
         };
-        // Find the prob for this point
+
         if let Some((_, prob, _, rel, _)) = ranked.get(i) {
             out.push_str(&format!("#   {} = {} (p={:.3})\n", ch, name, prob));
             let _ = rel;
@@ -2699,7 +2564,6 @@ pub fn render_sphere(
 pub fn detect_skills(root: &std::path::Path) -> Vec<String> {
     let mut skills = Vec::new();
 
-    // Check .ai/skills/ directory
     let skills_dir = root.join(".ai").join("skills");
     if let Ok(entries) = std::fs::read_dir(&skills_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -2709,7 +2573,6 @@ pub fn detect_skills(root: &std::path::Path) -> Vec<String> {
         }
     }
 
-    // Check for SKILL.md files (workspace skills)
     let workspace_skills = root.join("..").join("skills");
     if let Ok(entries) = std::fs::read_dir(&workspace_skills) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -2732,7 +2595,6 @@ pub fn skill_languages(skill: &str) -> Vec<String> {
     let skill_lower = skill.to_lowercase();
     let mut langs = Vec::new();
 
-    // Direct language mentions
     for lang in &[
         "rust",
         "python",
@@ -2756,7 +2618,6 @@ pub fn skill_languages(skill: &str) -> Vec<String> {
         }
     }
 
-    // Special cases
     if (skill_lower.contains("nvim") || skill_lower.contains("neovim"))
         && !langs.iter().any(|l| l == "lua")
     {
@@ -2777,14 +2638,6 @@ pub fn skill_boost(lang: &str, active_skills: &[String]) -> f64 {
     }
     1.0
 }
-
-// ---------------------------------------------------------------------------
-// Deliberate public API
-// ---------------------------------------------------------------------------
-//
-// This is the stable, documented interface for using bloch as a library.
-// All other `pub` items in this crate are low-level building blocks;
-// prefer these three items for new code.
 
 /// Configuration for mapping a repository.
 ///
@@ -2834,7 +2687,6 @@ impl RepoMap {
 pub fn map_repo(root: &Path, config: &MapConfig) -> Result<RepoMap> {
     let mut files: HashMap<String, FileData> = HashMap::new();
 
-    // SCIP integration (opt-in): try precise index first
     let scip_result = if config.use_scip {
         read_scip_index(root)
     } else {
@@ -2860,7 +2712,6 @@ pub fn map_repo(root: &Path, config: &MapConfig) -> Result<RepoMap> {
             );
         }
     } else {
-        // Fall back to tree-sitter per-file extraction
         for p in iter_all_files(root) {
             let rel = p
                 .strip_prefix(root)
@@ -3116,6 +2967,158 @@ pub fn todo_drop(root: &Path, id: usize) -> Result<()> {
     todo_save(root, &items)
 }
 
+/// A TODO/FIXME/etc marker found in source code.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CodeMarker {
+    /// Relative path from repo root
+    pub file: String,
+    /// 1-based line number
+    pub line: usize,
+    /// Marker kind: TODO, FIXME, HACK, XXX, BUG
+    pub kind: String,
+    /// Text after the marker
+    pub text: String,
+}
+
+/// Marker kinds to scan for (alphabetical).
+const MARKER_KINDS: &[&str] = &["BUG", "FIXME", "HACK", "TODO", "XXX"];
+
+/// Scan the repo for TODO/FIXME/HACK/XXX/BUG markers in comments.
+/// Returns markers sorted by (file, line). Skips binary files, target/,
+/// .git/, node_modules/, and files over 1MB.
+/// Contract: bounded — max 5000 markers returned.
+pub fn todo_scan(root: &Path) -> Vec<CodeMarker> {
+    const MAX_MARKERS: usize = 5000;
+    let mut markers = Vec::new();
+
+    for path in iter_all_files(root) {
+        if markers.len() >= MAX_MARKERS {
+            break;
+        }
+        let rel = match path.strip_prefix(root) {
+            Ok(r) => r.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+
+        if rel.starts_with(".ai/") {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for (i, line) in content.lines().enumerate() {
+            for kind in MARKER_KINDS {
+                let upper = line.to_uppercase();
+                if let Some(pos) = upper.find(kind) {
+                    let before_ok = pos == 0
+                        || line[..pos]
+                            .chars()
+                            .last()
+                            .is_none_or(|ch| !ch.is_alphanumeric());
+                    let after = &line[pos + kind.len()..];
+                    let after_ok = after.is_empty()
+                        || [':', ' ', '(', '[', '-'].contains(&after.chars().next().unwrap());
+                    if before_ok && after_ok {
+                        let text = after
+                            .trim_start_matches([':', ' ', '(', '[', '-'])
+                            .trim()
+                            .to_string();
+                        markers.push(CodeMarker {
+                            file: rel.clone(),
+                            line: i + 1,
+                            kind: kind.to_string(),
+                            text: if text.is_empty() {
+                                "(no description)".to_string()
+                            } else {
+                                text.chars().take(120).collect()
+                            },
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    markers.sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
+    markers
+}
+
+/// Extract the [file] source ref from a synced todo's text.
+/// Synced todos have format: `[path/to/file.rs] KIND: description`
+fn todo_source_ref(text: &str) -> Option<String> {
+    let t = text.trim();
+    if !t.starts_with('[') {
+        return None;
+    }
+    t.find(']').map(|end| t[1..end].to_string())
+}
+
+/// Reconcile .ai/todo.md with markers found in the repo.
+/// - Adds new markers as todos (format: `[file] KIND: text`)
+/// - Marks done any synced todo whose marker no longer exists
+/// - Leaves manual todos (no source ref) untouched
+///
+/// Returns `(added, completed)` counts.
+///
+/// Contract: never deletes todos; only adds or marks done.
+pub fn todo_sync(root: &Path) -> Result<(usize, usize)> {
+    let markers = todo_scan(root);
+    let mut items = todo_load(root);
+
+    let mut added = 0;
+    let mut completed = 0;
+
+    for m in &markers {
+        let key = format!("[{}]", m.file);
+        let already = items.iter().any(|it| {
+            it.text.starts_with(&key)
+                && it.text.contains(&m.kind)
+                && it
+                    .text
+                    .contains(m.text.chars().take(40).collect::<String>().as_str())
+        });
+        if !already {
+            items.push(TodoItem {
+                id: 0,
+                text: format!("[{}] {}: {}", m.file, m.kind, m.text),
+                done: false,
+            });
+            added += 1;
+        }
+    }
+
+    for it in items.iter_mut() {
+        if it.done {
+            continue;
+        }
+        if let Some(src_file) = todo_source_ref(&it.text) {
+            let still_exists = markers.iter().any(|m| {
+                m.file == src_file
+                    && it.text.contains(&m.kind)
+                    && it
+                        .text
+                        .contains(m.text.chars().take(40).collect::<String>().as_str())
+            });
+            if !still_exists {
+                let full = root.join(&src_file);
+                if full.exists() {
+                    it.done = true;
+                    completed += 1;
+                }
+            }
+        }
+    }
+
+    for (i, it) in items.iter_mut().enumerate() {
+        it.id = i + 1;
+    }
+
+    todo_save(root, &items)?;
+    Ok((added, completed))
+}
+
 /// Ahead/behind counts vs the upstream tracking branch.
 /// Returns (0, 0) if no upstream or not a git repo.
 pub fn git_ahead_behind(root: &Path) -> (usize, usize) {
@@ -3214,7 +3217,7 @@ mod tests {
         todo_drop(&root, 1).unwrap();
         let items = todo_list(&root);
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, 1); // renumbered
+        assert_eq!(items[0].id, 1);
         assert_eq!(items[0].text, "second task");
 
         let _ = fs::remove_dir_all(&root);
@@ -3265,9 +3268,8 @@ mod tests {
         assert!(mem_dir.join("archive").join("123-agent-test.md").exists());
         assert!(!mem_dir.join("inbox").join("123-agent-test.md").exists());
 
-        // Invalid target rejected
         assert!(memory_promote(&root, "x.md", "evil.md").is_err());
-        // Path traversal rejected
+
         assert!(memory_promote(&root, "../evil.md", "decisions.md").is_err());
 
         let _ = fs::remove_dir_all(&root);
@@ -3276,16 +3278,75 @@ mod tests {
     #[test]
     fn memory_read_bounded() {
         let root = tmp_root("memread");
-        assert_eq!(memory_read(&root), ""); // no .ai/memory
+        assert_eq!(memory_read(&root), "");
 
         let mem_dir = root.join(".ai").join("memory");
         fs::create_dir_all(&mem_dir).unwrap();
         fs::write(mem_dir.join("INDEX.md"), "# Index").unwrap();
-        // current.md missing -> marked missing
+
         let out = memory_read(&root);
         assert!(out.contains("## INDEX.md"));
         assert!(out.contains("# Index"));
         assert!(out.contains("## current.md (missing)"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn todo_scan_finds_markers() {
+        let root = tmp_root("scan");
+        fs::write(
+            root.join("a.rs"),
+            "// TODO: fix this\n// FIXME: and this\nlet x = 1;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b.py"),
+            "# HACK: workaround\n# not a marker: METHODODO\n",
+        )
+        .unwrap();
+        let markers = todo_scan(&root);
+
+        assert_eq!(markers.len(), 3, "got {:?}", markers);
+        assert_eq!(markers[0].file, "a.rs");
+        assert_eq!(markers[0].kind, "TODO");
+        assert_eq!(markers[0].line, 1);
+        assert!(markers[0].text.contains("fix this"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn todo_sync_adds_and_completes() {
+        let root = tmp_root("sync");
+        fs::write(root.join("a.rs"), "// TODO: new task\n").unwrap();
+
+        let (added, completed) = todo_sync(&root).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(completed, 0);
+        let items = todo_list(&root);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].text.contains("[a.rs]"));
+        assert!(items[0].text.contains("TODO"));
+
+        let (added, completed) = todo_sync(&root).unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(completed, 0);
+
+        fs::write(root.join("a.rs"), "let x = 1;\n").unwrap();
+        let (added, completed) = todo_sync(&root).unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(completed, 1);
+        let items = todo_list(&root);
+        assert!(items[0].done);
+
+        todo_add(&root, "manual task").unwrap();
+        fs::write(root.join("b.rs"), "// FIXME: another\n").unwrap();
+        let (added, completed) = todo_sync(&root).unwrap();
+        assert_eq!(added, 1);
+        assert_eq!(completed, 0);
+        let items = todo_list(&root);
+        let manual = items.iter().find(|i| i.text == "manual task").unwrap();
+        assert!(!manual.done);
 
         let _ = fs::remove_dir_all(&root);
     }
@@ -3300,7 +3361,7 @@ mod tests {
     #[test]
     fn git_wip_detail_clean_tree() {
         let root = tmp_root("wip");
-        // Not a git repo: run_git returns empty, tree reports clean
+
         let out = git_wip_detail(&root);
         assert!(out.contains("tree: clean"), "got {}", out);
         let _ = fs::remove_dir_all(&root);
@@ -3325,7 +3386,7 @@ mod tests {
         let text = "# **Bold** and `code` title";
         let (defs, _) = extract_markdown_ts(text.as_bytes()).unwrap();
         assert_eq!(defs.len(), 1);
-        // tree-sitter-md preserves inline formatting in heading_content
+
         assert!(defs[0].name.contains("Bold"));
     }
 
@@ -3379,9 +3440,9 @@ mod tests {
     fn rust_counts_references() {
         let src = b"struct Foo;\nfn bar() { let _ = Foo; bar(); }";
         let (_defs, refs) = extract_rust(src).unwrap();
-        // Foo referenced as a type
+
         assert!(refs.type_refs.get("Foo").unwrap_or(&0) >= &1);
-        // bar called (bare)
+
         let bare_calls: usize = refs
             .call
             .iter()
@@ -3395,9 +3456,8 @@ mod tests {
     fn toml_extracts_tables() {
         let text = "[package]\nname = \"foo\"\n\n[dependencies]\nserde = \"1\"";
         let (defs, _, lang) = {
-            // Simulate via extract dispatch on a temp path
             let text = text.to_string();
-            // Direct test of the TOML branch logic
+
             let re = regex::Regex::new(r"^\[([^\]]+)\]").expect("hardcoded bracket regex");
             let mut defs = Vec::new();
             for line in text.lines() {
@@ -3423,7 +3483,7 @@ mod tests {
     #[test]
     fn yaml_extracts_top_level_keys() {
         let text = "name: foo\nversion: 1.0\n  nested: should_not_match";
-        // Direct logic test (mirrors extract dispatch)
+
         let re =
             regex::Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\-]*)\s*:").expect("hardcoded key regex");
         let mut names = Vec::new();
@@ -3465,7 +3525,7 @@ mod tests {
     #[test]
     fn mod_segments_extracts_crate_path() {
         let segs = mod_segments("crates/foo/src/bar/baz.rs");
-        assert_eq!(segs, vec!["foo", "baz"]); // NOTE: intermediate dirs without .rs are skipped (matches Python)
+        assert_eq!(segs, vec!["foo", "baz"]);
     }
 
     #[test]
@@ -3490,7 +3550,6 @@ mod tests {
         use std::fs::{self, FileTimes};
         use std::time::{Duration, SystemTime};
 
-        // Create temp dir structure
         let tmp = std::env::temp_dir().join(format!("bloch-scip-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("src")).unwrap();
@@ -3502,16 +3561,13 @@ mod tests {
         fs::write(&index_path, b"fake").unwrap();
         fs::write(&src_path, b"fn main() {}").unwrap();
 
-        // Set index to old time, source to new time
         let old_time = SystemTime::now() - Duration::from_secs(3600);
         let new_time = SystemTime::now();
         fs::set_times(&index_path, FileTimes::new().set_modified(old_time)).unwrap();
         fs::set_times(&src_path, FileTimes::new().set_modified(new_time)).unwrap();
 
-        // Should detect stale (source newer than index)
         assert!(is_scip_stale(&index_path, &tmp));
 
-        // Reverse: source older than index -> not stale
         fs::set_times(&src_path, FileTimes::new().set_modified(old_time)).unwrap();
         fs::set_times(&index_path, FileTimes::new().set_modified(new_time)).unwrap();
         assert!(!is_scip_stale(&index_path, &tmp));
@@ -3523,7 +3579,6 @@ mod tests {
     fn memory_rejects_path_traversal() {
         use std::path::PathBuf;
 
-        // Root with parent dir components should be rejected
         let evil_root = PathBuf::from("/tmp/foo/../../etc");
         let cached = CachedMap {
             timestamp: "test".to_string(),
@@ -3556,15 +3611,12 @@ mod tests {
             languages: std::collections::HashMap::new(),
         };
 
-        // Write should succeed and produce valid JSON
         let path = write_memory_cache(&tmp, &cached).unwrap();
         assert!(path.exists());
 
-        // No temp file should be left behind
         let tmp_file = path.with_extension("tmp");
         assert!(!tmp_file.exists());
 
-        // Content should be valid JSON
         let content = fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed["timestamp"], "2026-10-04T00:00:00Z");
@@ -3579,7 +3631,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let path = tmp.join("bad.rs");
-        // Invalid UTF-8 bytes: should not panic, should use lossy conversion
+
         fs::write(&path, b"fn main() {\xff\xfe invalid }").unwrap();
         let result = extract(&path, "bad.rs");
         assert!(result.is_ok());
@@ -3606,7 +3658,7 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let path = tmp.join("data.bin");
-        // Random binary data with no valid structure
+
         let data: Vec<u8> = (0..1024).map(|i| (i * 7 % 256) as u8).collect();
         fs::write(&path, &data).unwrap();
         let result = extract(&path, "data.bin");
@@ -3637,11 +3689,11 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join("src")).unwrap();
         fs::write(tmp.join("src").join("main.rs"), b"fn main() {}").unwrap();
-        // Create a symlink loop: link -> ..
+
         let _ = symlink("..", tmp.join("src").join("loop"));
         let config = MapConfig::default();
         let result = map_repo(&tmp, &config);
-        // Should not hang or crash on symlink loop
+
         assert!(result.is_ok());
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -3652,7 +3704,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("bloch-unicode-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
-        // Unicode filename: should not panic
+
         fs::write(tmp.join("文件.rs"), "fn 主() {}".as_bytes()).unwrap();
         let config = MapConfig::default();
         let result = map_repo(&tmp, &config);
@@ -3680,8 +3732,7 @@ mod tests {
         use std::path::PathBuf;
         let config = MapConfig::default();
         let result = map_repo(&PathBuf::from("/nonexistent/path/12345"), &config);
-        // Should return Ok with empty map (iter_all_files handles gracefully)
-        // or Err, but must not panic
+
         let _ = result;
     }
 
@@ -3691,13 +3742,13 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("bloch-scip-bad-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".scip")).unwrap();
-        // Write garbage that's not valid protobuf
+
         fs::write(
             tmp.join(".scip").join("index.scip"),
             b"\xff\xfe\x00 garbage not protobuf",
         )
         .unwrap();
-        // Should return None (graceful fallback), not panic
+
         let result = read_scip_index(&tmp);
         assert!(result.is_none());
         let _ = fs::remove_dir_all(&tmp);
@@ -3709,10 +3760,10 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("bloch-scip-trunc-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(tmp.join(".scip")).unwrap();
-        // Truncated protobuf (valid header, cut off)
+
         fs::write(tmp.join(".scip").join("index.scip"), b"\x0a\x10\x0a\x0c").unwrap();
         let result = read_scip_index(&tmp);
-        // Should not panic
+
         let _ = result;
         let _ = fs::remove_dir_all(&tmp);
     }
@@ -3731,23 +3782,22 @@ mod tests {
 
     #[test]
     fn skill_boost_handles_hostile_names() {
-        // Empty skill name
         assert_eq!(skill_boost("rust", &["".to_string()]), 1.0);
-        // Skill with path traversal
+
         assert_eq!(skill_boost("rust", &["../../etc".to_string()]), 1.0);
-        // Skill with null bytes
+
         assert_eq!(skill_boost("rust", &["tiger\x00style".to_string()]), 1.0);
-        // Very long skill name
+
         let long = "a".repeat(10000);
         assert_eq!(skill_boost("rust", &[long]), 1.0);
-        // Valid skill still works
+
         assert!(skill_boost("rust", &["tiger-style-rust".to_string()]) > 1.0);
     }
 
     #[test]
     fn detect_skills_handles_missing_dir() {
         use std::path::PathBuf;
-        // Nonexistent .ai/skills should return empty, not panic
+
         let result = detect_skills(&PathBuf::from("/nonexistent/12345"));
         assert!(result.is_empty());
     }
@@ -3787,11 +3837,9 @@ object Singleton {
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
 
-        // Missing file -> Ok(None)
         let result = read_memory_cache(&tmp).unwrap();
         assert!(result.is_none());
 
-        // Corrupt JSON -> Err (not Ok(None))
         let mem_dir = tmp.join(".ai").join("memory");
         fs::create_dir_all(&mem_dir).unwrap();
         fs::write(mem_dir.join("bloch-last.json"), b"{ invalid json !!!").unwrap();
@@ -3802,7 +3850,6 @@ object Singleton {
             _ => panic!("expected JsonError"),
         }
 
-        // Valid JSON -> Ok(Some)
         let cached = CachedMap {
             timestamp: "2026-10-04T00:00:00Z".to_string(),
             git_head: String::new(),

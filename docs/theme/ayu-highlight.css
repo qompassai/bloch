@@ -1,0 +1,65 @@
+/* Qompass theme for mdBook — syntax highlighting (highlight.js).
+   Keywords burn violet, types glow Cherenkov, literals are brass. */
+
+.hljs {
+  color: var(--qompass-starlight);
+  background: transparent;
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--qompass-fog);
+  font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-doctag,
+.hljs-template-tag {
+  color: #a58bff;
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-meta .hljs-string {
+  color: #7fd4a8;
+}
+
+.hljs-number,
+.hljs-literal {
+  color: var(--qompass-brass);
+}
+
+.hljs-title,
+.hljs-title.function_,
+.hljs-section {
+  color: var(--qompass-cherenkov-soft);
+}
+
+.hljs-title.class_,
+.hljs-type,
+.hljs-built_in,
+.hljs-builtin-name {
+  color: var(--qompass-cherenkov);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-name {
+  color: #c8d6ee;
+}
+
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: #a58bff;
+}
+
+.hljs-emphasis { font-style: italic; }
+.hljs-strong { font-weight: 700; }
+.hljs-addition { color: #7fd4a8; }
+.hljs-deletion { color: #ff8f8f; }

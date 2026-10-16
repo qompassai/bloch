@@ -5,9 +5,11 @@
 //! single-qubit states onto a 3D unit sphere, bloch maps the sprawling state
 //! of a codebase onto a compact, ranked representation.
 //!
-//! Walks a repo's text files, extracts structure (full tree-sitter for Rust,
-//! shallow regex for other languages), ranks definitions by qualified
-//! reference counting with recency weighting, and emits a budgeted map.
+//! Walks a repo's text files, extracts structure (tree-sitter for Rust,
+//! Lua, Python, Nix, Markdown, Kotlin, Bash, and TypeScript; line patterns
+//! for Ruby/Fastlane, Starlark, TOML, and YAML), ranks definitions by
+//! qualified reference counting with recency weighting, and emits a
+//! budgeted map.
 //!
 //! Handoff fidelity: output leads with git session state, .ai/memory/
 //! contents, and cached test status so any AI model can pick up where the
@@ -2225,6 +2227,47 @@ fn extract_ruby_fastlane(text: &str) -> Vec<Definition> {
     defs
 }
 
+fn extract_toml(text: &str) -> Vec<Definition> {
+    let re = Regex::new(r"^\[([^\]]+)\]").expect("hardcoded bracket regex");
+    let mut defs = Vec::new();
+    for line in text.lines() {
+        let stripped = line.trim();
+        if let Some(caps) = re.captures(stripped) {
+            let sig: String = stripped.chars().take(100).collect();
+            defs.push(Definition {
+                name: caps[1].to_string(),
+                kind: "table".to_string(),
+                is_pub: true,
+                sig,
+                impl_target: None,
+                lang: "toml".to_string(),
+            });
+        }
+    }
+    defs.truncate(30);
+    defs
+}
+
+fn extract_yaml(text: &str) -> Vec<Definition> {
+    let re = Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\-]*)\s*:").expect("hardcoded key regex");
+    let mut defs = Vec::new();
+    for line in text.lines() {
+        if let Some(caps) = re.captures(line) {
+            let sig: String = line.trim().chars().take(100).collect();
+            defs.push(Definition {
+                name: caps[1].to_string(),
+                kind: "key".to_string(),
+                is_pub: true,
+                sig,
+                impl_target: None,
+                lang: "yaml".to_string(),
+            });
+        }
+    }
+    defs.truncate(30);
+    defs
+}
+
 fn extract_generic(text: &str, lang: &str, rel: &str) -> Vec<Definition> {
     let lines: Vec<&str> = text.lines().collect();
     let non_empty = lines.iter().filter(|l| !l.trim().is_empty()).count();
@@ -2331,23 +2374,7 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
     }
 
     if ext == ".toml" {
-        let re = Regex::new(r"^\[([^\]]+)\]").expect("hardcoded bracket regex");
-        let mut defs = Vec::new();
-        for line in text.lines() {
-            let stripped = line.trim();
-            if let Some(caps) = re.captures(stripped) {
-                let sig: String = stripped.chars().take(100).collect();
-                defs.push(Definition {
-                    name: caps[1].to_string(),
-                    kind: "table".to_string(),
-                    is_pub: true,
-                    sig,
-                    impl_target: None,
-                    lang: "toml".to_string(),
-                });
-            }
-        }
-        defs.truncate(30);
+        let defs = extract_toml(&text);
         if defs.is_empty() {
             return Ok((
                 extract_generic(&text, "toml", rel),
@@ -2359,22 +2386,7 @@ pub fn extract(path: &Path, rel: &str) -> Result<(Vec<Definition>, Refs, String)
     }
 
     if ext == ".yaml" || ext == ".yml" {
-        let re = Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\-]*)\s*:").expect("hardcoded key regex");
-        let mut defs = Vec::new();
-        for line in text.lines() {
-            if let Some(caps) = re.captures(line) {
-                let sig: String = line.trim().chars().take(100).collect();
-                defs.push(Definition {
-                    name: caps[1].to_string(),
-                    kind: "key".to_string(),
-                    is_pub: true,
-                    sig,
-                    impl_target: None,
-                    lang: "yaml".to_string(),
-                });
-            }
-        }
-        defs.truncate(30);
+        let defs = extract_yaml(&text);
         if defs.is_empty() {
             return Ok((
                 extract_generic(&text, "yaml", rel),
@@ -3455,27 +3467,8 @@ mod tests {
     #[test]
     fn toml_extracts_tables() {
         let text = "[package]\nname = \"foo\"\n\n[dependencies]\nserde = \"1\"";
-        let (defs, _, lang) = {
-            let text = text.to_string();
-
-            let re = regex::Regex::new(r"^\[([^\]]+)\]").expect("hardcoded bracket regex");
-            let mut defs = Vec::new();
-            for line in text.lines() {
-                let stripped = line.trim();
-                if let Some(caps) = re.captures(stripped) {
-                    defs.push(Definition {
-                        name: caps[1].to_string(),
-                        kind: "table".to_string(),
-                        is_pub: true,
-                        sig: stripped.chars().take(100).collect(),
-                        impl_target: None,
-                        lang: "toml".to_string(),
-                    });
-                }
-            }
-            (defs, (), "toml".to_string())
-        };
-        assert_eq!(lang, "toml");
+        let defs = extract_toml(text);
+        assert!(defs.iter().all(|d| d.kind == "table" && d.lang == "toml"));
         assert!(defs.iter().any(|d| d.name == "package"));
         assert!(defs.iter().any(|d| d.name == "dependencies"));
     }
@@ -3483,33 +3476,20 @@ mod tests {
     #[test]
     fn yaml_extracts_top_level_keys() {
         let text = "name: foo\nversion: 1.0\n  nested: should_not_match";
-
-        let re =
-            regex::Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_\-]*)\s*:").expect("hardcoded key regex");
-        let mut names = Vec::new();
-        for line in text.lines() {
-            if let Some(caps) = re.captures(line) {
-                names.push(caps[1].to_string());
-            }
-        }
-        assert!(names.contains(&"name".to_string()));
-        assert!(names.contains(&"version".to_string()));
-        assert!(!names.contains(&"nested".to_string()));
+        let defs = extract_yaml(text);
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"name"));
+        assert!(names.contains(&"version"));
+        assert!(!names.contains(&"nested"));
     }
 
     #[test]
     fn shell_extracts_functions() {
         let text = "#!/bin/bash\nhello() {\n  echo hi\n}\n\nworld() {\n  echo bye\n}";
-        let re = regex::Regex::new(r"^([a-zA-Z_][a-zA-Z0-9_]*)\s*\(\)").unwrap();
-        let mut names = Vec::new();
-        for line in text.lines() {
-            let stripped = line.trim();
-            if let Some(caps) = re.captures(stripped) {
-                names.push(caps[1].to_string());
-            }
-        }
-        assert!(names.contains(&"hello".to_string()));
-        assert!(names.contains(&"world".to_string()));
+        let (defs, _refs) = extract_bash(text.as_bytes()).unwrap();
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"hello"));
+        assert!(names.contains(&"world"));
     }
 
     #[test]

@@ -3379,8 +3379,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    use super::*;
-
     #[test]
     fn markdown_extracts_headers() {
         let text = "# Title\n## Section\n### Sub\n\nBody text";

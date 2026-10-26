@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Published to crates.io as package `blochs` (the name `bloch` was taken in Oct 2026); the library and binary remain named `bloch`.
+
 ### Added
 - `bloch memory read`: bounded session-start read of INDEX.md + current.md
 - `bloch memory inbox`: timestamped inbox entries (`<epoch>-<agent>-<topic>.md`)

@@ -1,5 +1,5 @@
 [package]
-name = "bloch"
+name = "blochs"
 version = "0.1.0"
 edition = "2021"
 description = "Ranked, budgeted codebase maps for coding agents with session handoff fidelity"

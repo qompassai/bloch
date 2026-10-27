@@ -1,10 +1,12 @@
 //! bloch: ranked, budgeted codebase maps for coding agents.
 use bloch::{
-    detect_skills, diff_maps, get_file_recency_boost, get_file_why, get_memory_context,
-    get_session_state, get_test_status, git_ahead_behind, git_wip_detail, map_repo, memory_inbox,
-    memory_promote, memory_read, read_memory_cache, render_sphere, skill_boost, todo_add,
-    todo_done, todo_drop, todo_list, todo_sync, write_memory_cache, write_memory_summary,
-    CachedMap, Definition, MapConfig, RefKey, RefKind,
+    bloch_init, detect_skills, diff_maps, get_file_recency_boost, get_file_why, get_memory_context,
+    get_roadmap_section, get_session_state, get_test_status, git_ahead_behind, git_wip_detail,
+    map_repo, memory_inbox, memory_promote, memory_read, read_memory_cache, render_roadmap_status,
+    render_sphere, roadmap_diff_section, roadmap_status, skill_boost, task_done, task_export_opst,
+    task_fail, task_lessons, task_start, todo_add, todo_done, todo_drop, todo_list, todo_sync,
+    write_memory_cache, write_memory_summary, write_roadmap_cache, CachedMap, ContentLabel,
+    Definition, MapConfig, RefKey, RefKind, RepoKind,
 };
 use clap::Parser;
 use std::collections::{HashMap, HashSet};
@@ -77,6 +79,114 @@ enum Command {
         root: PathBuf,
         #[command(subcommand)]
         op: GitOp,
+    },
+    /// Initialise bloch in a repo (.ai/memory + a v0.1 -> v1.0 roadmap)
+    Init {
+        /// Root of the repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        /// Force the repo kind (mcp|game|app|education|tutorial);
+        /// detected with evidence when omitted
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    /// Roadmap task lifecycle: the gated green path (.ai/roadmap.md)
+    Task {
+        /// Root of the repository (defaults to current directory)
+        #[arg(long, default_value = ".")]
+        root: PathBuf,
+        #[command(subcommand)]
+        op: TaskOp,
+    },
+    /// Serve the fleet MCP server over stdio (files stay canonical)
+    Serve {
+        /// Registered repo roots (repeatable; defaults to current dir)
+        #[arg(long = "root")]
+        roots: Vec<PathBuf>,
+        /// appa.toml-style policy file (lanes, clearances, leases)
+        #[arg(long)]
+        policy: Option<PathBuf>,
+        /// Extra file with `lease ...` lines (the attention board export)
+        #[arg(long)]
+        leases: Option<PathBuf>,
+        /// Idea register file (IDEAS.md)
+        #[arg(long)]
+        ideas: Option<PathBuf>,
+        /// Progress board file (TRACKER.md) for rollup ordering
+        #[arg(long)]
+        board: Option<PathBuf>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum TaskOp {
+    /// Start an attempt on a roadmap task (times it, logs it)
+    Start {
+        /// Task ID (R-<phase><seq>)
+        id: String,
+        /// Agent/model name recorded on the attempt
+        #[arg(long, default_value = "agent")]
+        agent: String,
+        /// Self-rated confidence 0-100
+        #[arg(long)]
+        confidence: Option<u32>,
+        /// Claimed content label: sfw|nsfw (needs --label-evidence)
+        #[arg(long)]
+        label: Option<String>,
+        /// Evidence for the claimed content label
+        #[arg(long, default_value = "")]
+        label_evidence: String,
+    },
+    /// Complete a task: runs every verify: command; green only if all pass
+    Done {
+        /// Task ID (R-<phase><seq>)
+        id: String,
+        /// Self-rated confidence 0-100
+        #[arg(long)]
+        confidence: Option<u32>,
+        /// What was done (recorded; becomes the fix note after failures)
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Claimed content label: sfw|nsfw (needs --label-evidence)
+        #[arg(long)]
+        label: Option<String>,
+        /// Evidence for the claimed content label
+        #[arg(long, default_value = "")]
+        label_evidence: String,
+    },
+    /// Record a voluntary failure against a task
+    Fail {
+        /// Task ID (R-<phase><seq>)
+        id: String,
+        /// What went wrong
+        #[arg(long)]
+        error: String,
+        /// Self-rated confidence 0-100
+        #[arg(long)]
+        confidence: Option<u32>,
+        /// Extra note
+        #[arg(long, default_value = "")]
+        note: String,
+        /// Claimed content label: sfw|nsfw (needs --label-evidence)
+        #[arg(long)]
+        label: Option<String>,
+        /// Evidence for the claimed content label
+        #[arg(long, default_value = "")]
+        label_evidence: String,
+    },
+    /// Roadmap progress: % green, phase, next open, live attempts
+    Status,
+    /// Distilled lessons (lessons.md, else unpromoted attempt-fix entries)
+    Lessons {
+        /// Emit in the export shape for skills/MCP consumers
+        #[arg(long)]
+        export: bool,
+    },
+    /// Export attempts as OPST trajectory material (read-only)
+    Export {
+        /// Export format (only `opst` is defined)
+        #[arg(long, default_value = "opst")]
+        format: String,
     },
 }
 
@@ -336,6 +446,192 @@ fn main() {
         return;
     }
 
+    if let Some(Command::Init { root, kind }) = &args.command {
+        let root = root.canonicalize().unwrap_or(root.clone());
+        let kind_override = match kind {
+            Some(k) => match RepoKind::parse(k) {
+                Some(RepoKind::Mcp) => Some(RepoKind::Mcp),
+                Some(RepoKind::Game) => Some(RepoKind::Game),
+                Some(RepoKind::App) => Some(RepoKind::App),
+                Some(RepoKind::Education) => Some(RepoKind::Education),
+                Some(RepoKind::Tutorial) => Some(RepoKind::Tutorial),
+                _ => {
+                    eprintln!(
+                        "bloch: error: --kind must be one of mcp, game, app, education, tutorial"
+                    );
+                    std::process::exit(2);
+                }
+            },
+            None => None,
+        };
+        match bloch_init(&root, kind_override) {
+            Ok(outcome) => {
+                println!("kind detection (acted on: {}):", outcome.kind.as_str());
+                for ev in &outcome.detection.evidence {
+                    println!("  {}", ev);
+                }
+                eprintln!("bloch: {}", outcome.message);
+            }
+            Err(e) => {
+                eprintln!("bloch: error: {}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    if let Some(Command::Task { root, op }) = &args.command {
+        let root = root.canonicalize().unwrap_or(root.clone());
+        let parse_label = |label: &Option<String>| -> Option<ContentLabel> {
+            match label {
+                None => None,
+                Some(s) => match ContentLabel::parse(s) {
+                    Some(l) => Some(l),
+                    None => {
+                        eprintln!("bloch: error: --label must be sfw or nsfw");
+                        std::process::exit(2);
+                    }
+                },
+            }
+        };
+        match op {
+            TaskOp::Start {
+                id,
+                agent,
+                confidence,
+                label,
+                label_evidence,
+            } => match task_start(
+                &root,
+                id,
+                agent,
+                *confidence,
+                parse_label(label),
+                label_evidence,
+            ) {
+                Ok(msg) => eprintln!("bloch: {}", msg),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            TaskOp::Done {
+                id,
+                confidence,
+                note,
+                label,
+                label_evidence,
+            } => match task_done(
+                &root,
+                id,
+                *confidence,
+                note,
+                parse_label(label),
+                label_evidence,
+            ) {
+                Ok(outcome) if outcome.passed => {
+                    eprintln!("bloch: {} is green ({})", id, outcome.evidence)
+                }
+                Ok(outcome) => {
+                    eprintln!("bloch: {} NOT green: {}", id, outcome.evidence);
+                    for (cmd, code, tail, timed_out) in &outcome.failing {
+                        eprintln!(
+                            "  failed: {} (exit {:?}{})",
+                            cmd,
+                            code,
+                            if *timed_out { ", timed out" } else { "" }
+                        );
+                        if !tail.trim().is_empty() {
+                            eprintln!("  output tail:\n{}", tail.trim_end());
+                        }
+                    }
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            TaskOp::Fail {
+                id,
+                error,
+                confidence,
+                note,
+                label,
+                label_evidence,
+            } => match task_fail(
+                &root,
+                id,
+                error,
+                *confidence,
+                note,
+                parse_label(label),
+                label_evidence,
+            ) {
+                Ok(msg) => eprintln!("bloch: {}", msg),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            TaskOp::Status => match roadmap_status(&root) {
+                Ok(st) => print!("{}", render_roadmap_status(&st)),
+                Err(e) => {
+                    eprintln!("bloch: error: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            TaskOp::Lessons { export } => {
+                let out = task_lessons(&root, *export);
+                print!("{}", out);
+                if !out.ends_with('\n') {
+                    println!();
+                }
+            }
+            TaskOp::Export { format } => {
+                if format != "opst" {
+                    eprintln!("bloch: error: unsupported_format: only --format opst is defined");
+                    std::process::exit(2);
+                }
+                match task_export_opst(&root) {
+                    Ok(out) => print!("{}", out),
+                    Err(e) => {
+                        eprintln!("bloch: error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if let Some(Command::Serve {
+        roots,
+        policy,
+        leases,
+        ideas,
+        board,
+    }) = &args.command
+    {
+        let roots = if roots.is_empty() {
+            vec![PathBuf::from(".")]
+        } else {
+            roots.clone()
+        };
+        let config = bloch::server::ServerConfig {
+            board_path: board.clone(),
+            ideas_path: ideas.clone(),
+            leases_path: leases.clone(),
+            policy_path: policy.clone(),
+            roots,
+        };
+        if let Err(e) = bloch::server::serve_stdio(config) {
+            eprintln!("bloch: error: {}", e);
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if let Some(Command::Git { root, op }) = &args.command {
         let root = root.canonicalize().unwrap_or(root.clone());
         match op {
@@ -497,8 +793,13 @@ fn main() {
     let session = get_session_state(&root);
     let memory = get_memory_context(&root, 3000);
     let test_status = get_test_status(&root, 800);
+    let roadmap_section = get_roadmap_section(&root, 1200);
 
-    if !session.is_empty() || !memory.is_empty() || !test_status.is_empty() {
+    if !session.is_empty()
+        || !memory.is_empty()
+        || !test_status.is_empty()
+        || !roadmap_section.is_empty()
+    {
         lines.push(format!("# {}", "=".repeat(60)));
         lines.push("# HANDOFF: where the last session left off".to_string());
         lines.push(format!("# {}", "=".repeat(60)));
@@ -513,6 +814,10 @@ fn main() {
         if !test_status.is_empty() {
             lines.push(String::new());
             lines.extend(test_status.lines().map(|l| l.to_string()));
+        }
+        if !roadmap_section.is_empty() {
+            lines.push(String::new());
+            lines.extend(roadmap_section.lines().map(|l| l.to_string()));
         }
         lines.push(String::new());
         lines.push(format!("# {}", "=".repeat(60)));
@@ -629,7 +934,11 @@ fn main() {
         };
         match read_memory_cache(&root) {
             Ok(Some(old)) => {
-                let diff = diff_maps(&old, &current);
+                let mut diff = diff_maps(&old, &current);
+                let roadmap_movement = roadmap_diff_section(&root);
+                if !roadmap_movement.is_empty() {
+                    diff.push_str(&roadmap_movement);
+                }
                 if args.out == "-" {
                     print!("{}", diff);
                 } else {
@@ -712,6 +1021,11 @@ fn main() {
         match write_memory_cache(&root, &cached) {
             Ok(p) => eprintln!("bloch: wrote {}", p.display()),
             Err(e) => eprintln!("bloch: failed to write cache: {}", e),
+        }
+        match write_roadmap_cache(&root) {
+            Ok(Some(p)) => eprintln!("bloch: wrote {}", p.display()),
+            Ok(None) => {}
+            Err(e) => eprintln!("bloch: failed to write roadmap cache: {}", e),
         }
     }
     eprintln!(

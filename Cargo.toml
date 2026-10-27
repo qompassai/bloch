@@ -1,6 +1,6 @@
 [package]
 name = "blochs"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2021"
 description = "Ranked, budgeted codebase maps for coding agents with session handoff fidelity"
 license = "Apache-2.0"

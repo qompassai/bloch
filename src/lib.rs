@@ -65,6 +65,13 @@ pub enum BlochError {
 /// Result type for bloch operations.
 pub type Result<T> = std::result::Result<T, BlochError>;
 
+/// Roadmap system (v0.2): init, templates, gated task lifecycle, lessons.
+pub mod roadmap;
+/// MCP server (v0.3, SPEC §8): fleet memory/roadmap/lessons over stdio.
+pub mod server;
+
+pub use roadmap::*;
+
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -293,6 +300,12 @@ pub fn write_memory_summary(
     ) {
         out.truncate(idx);
         out.push_str(&top_section);
+    }
+
+    // Roadmap summary (v0.2, SPEC §7): --update-memory also refreshes the
+    // roadmap counts into the summary when the repo has a roadmap.
+    if let Some(roadmap_block) = roadmap_summary_for_map(root) {
+        out.push_str(&roadmap_block);
     }
 
     atomic_write(&path, &out)?;
@@ -2838,10 +2851,11 @@ pub fn memory_inbox(root: &Path, agent: &str, topic: &str, content: &str) -> Res
 /// Promote an inbox entry to a curated memory file.
 /// Appends inbox/<file> content to .ai/memory/<target>, then moves the
 /// inbox file to .ai/memory/archive/.
-/// Contract: target must be decisions.md, patterns.md, or current.md.
+/// Contract: target must be decisions.md, patterns.md, current.md, or
+/// lessons.md (the roadmap learning-loop target, v0.2).
 /// Rejects path traversal in file name.
 pub fn memory_promote(root: &Path, file: &str, target: &str) -> Result<String> {
-    const ALLOWED: &[&str] = &["decisions.md", "patterns.md", "current.md"];
+    const ALLOWED: &[&str] = &["decisions.md", "patterns.md", "current.md", "lessons.md"];
     if !ALLOWED.contains(&target) {
         return Err(BlochError::GitFailed(format!(
             "invalid target '{}': must be one of {}",

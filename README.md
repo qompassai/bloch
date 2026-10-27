@@ -91,6 +91,84 @@ Memory files:
 The HANDOFF section of `bloch` output includes `.ai/memory/` contents so
 the next agent session starts with full context.
 
+## Roadmap (v0.2): the longitudinal v1 tracker
+
+`bloch init` adds a repo-kind-specialised roadmap that takes a repo from
+its v0.1 baseline to a fully functional v1 — any agent can pick it up
+and work it, and bloch itself keeps the tracker honest:
+
+```sh
+bloch init                       # detect kind (evidence reported), scaffold .ai/roadmap.md
+bloch init --kind mcp            # or force the kind: mcp|game|app|education|tutorial
+bloch task start R-101 --agent claude --confidence 80
+bloch task done  R-101 --note "what I did"   # runs every verify: command; green only if all pass
+bloch task fail  R-101 --error "what went wrong"
+bloch task status                # % green, current phase, next open, live attempts
+bloch task lessons --export      # distilled fixes from fail -> pass sequences
+bloch task export --format opst  # attempts as OPST trajectory material (read-only)
+```
+
+- **Stable IDs** (`R-101`, `R-102`, …) are never renumbered; dropped
+  tasks are struck through, not deleted.
+- **Green is gated.** There is no override flag and no self-declared
+  done: `task done` executes the task's `verify:` commands (600 s
+  timeout each, output tail capped; repo-authored trusted input, the
+  Makefile trust class) and flips `[x]` only on all-pass. A task with
+  no `verify:` lines can never go green.
+- **Attempts are evidence.** `.ai/memory/attempts.jsonl` is append-only:
+  agent, timing, self-rated confidence, error/evidence per attempt.
+  Failures auto-file memory inbox entries; a fail → pass sequence
+  auto-files an `attempt-fix-<id>` entry for promotion into
+  `.ai/memory/lessons.md`, and the HANDOFF section leads with the
+  roadmap state and the most recent lessons.
+- **Config/dotfiles repos are refused a roadmap** (memory-only init) —
+  there is no v1 to track for a dotfiles tree.
+- **Lane labels from birth.** Repos are assigned a content lane in
+  the policy configuration, and every attempt/lesson record carries
+  `origin_lane`, `content_label` (sfw|nsfw), and label evidence.
+  Defaults fail closed (content from a restricted-lane origin without
+  positive SFW evidence is labeled nsfw), and labels never change at
+  transfer time.
+- **Failures feed research.** Fail events carry a deduplicated failure
+  signature; externally-implicating failures (dependency, upstream,
+  protocol, hardware) file a research candidate in the inbox (a
+  standard finding record: system, signature, source, status — one
+  per signature, recurrence counted), after a check against
+  the curated lessons. Curated records carry `last_verified` /
+  `applies_to` staleness fields and a `disposition` slot
+  (extract / reverse-engineer / adapt / clean-build).
+
+## MCP server (v0.3): shared memory + lesson sharing
+
+`bloch serve` is the shared, multi-repo surface over the same files.
+Files stay canonical — the
+server is an index, a query surface, and a write gate, never the
+store; with the server down, the CLI + files carry the full workflow
+and the index rebuilds identically on restart.
+
+```sh
+bloch serve --root ~/repos/a --root ~/repos/b \
+  --policy policy.toml --ideas ~/register/IDEAS.md --board ~/board/TRACKER.md
+```
+
+11 tools, annotations from birth: `memory_search` / `memory_get`
+(read), `memory_propose` (inbox-only; requires the repo's current
+fencing generation and a live attention lease, verified
+server-side from the policy file), `memory_promote` (curator gate;
+proposer ≠ promoter; evidence must resolve), `tracker_state` /
+`tracker_rollup`, `idea_lookup` / `idea_register` (gated),
+`lessons_search` (cross-repo lessons + attempt aggregates),
+`roadmap_state` / `roadmap_rollup`. Content lanes are enforced in
+server code: nsfw-labeled entries are never served to callers whose
+clearance covers only the general lane, and nsfw content cannot be
+proposed into a general-lane repo. The operator's own private memory
+directories are refused as index roots and never served. Transport is
+stdio JSON-RPC, hand-rolled on serde_json (no new dependencies),
+with a dual-era posture (legacy `initialize` + `server/discover`).
+Access posture: declared access above matches the detected surface —
+read tools are read-only, writes are inbox-only or gate-class, no
+tool exceeds its annotations; license Apache-2.0.
+
 ## Skill-aware ranking
 
 `bloch` detects active skills from `.ai/skills/` and boosts definitions in
@@ -115,7 +193,7 @@ their current task.
 ## Install
 
 ```sh
-cargo install bloch
+cargo install blochs   # package name is `blochs` (`bloch` was taken); the installed binary is `bloch`
 ```
 
 ## Usage

@@ -65,6 +65,9 @@ pub enum BlochError {
 /// Result type for bloch operations.
 pub type Result<T> = std::result::Result<T, BlochError>;
 
+/// Era guard (v0.4): the stdio front door of the MCP server —
+/// modern-era admission in front of the rmcp SDK.
+pub mod guard;
 /// Roadmap system (v0.2): init, templates, gated task lifecycle, lessons.
 pub mod roadmap;
 /// MCP server (v0.3, SPEC §8): fleet memory/roadmap/lessons over stdio.

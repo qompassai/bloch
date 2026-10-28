@@ -11,13 +11,25 @@
 //! general-only callers, and proposing nsfw content into a
 //! general-lane repo is a typed refusal.
 //!
-//! Transport: stdio JSON-RPC, hand-rolled on serde_json (no new
-//! dependencies). Dual-era posture (LINKING §2.3): legacy `initialize`
-//! negotiation plus the modern `server/discover` method.
+//! Transport: stdio JSON-RPC on the rmcp SDK behind the era guard
+//! ([`crate::guard`]), modern era only (2026-07-28) since v0.4 —
+//! D-113 supersedes the dual-era posture of LINKING §2.3. The SDK
+//! owns framing; the domain logic in this module (index, lane law,
+//! gated writes) is unchanged from the hand-rolled era.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use rmcp::model::{
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, Implementation,
+    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
+    ServerConfig as RmcpServerConfig, Tool,
+};
+use rmcp::service::RequestContext;
+use rmcp::transport::async_rw::AsyncRwTransport;
+use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 
 use crate::roadmap::{
     attempt_history, decide_content_label, label_frontmatter, now_epoch, parse_label_frontmatter,
@@ -26,8 +38,10 @@ use crate::roadmap::{
 };
 use crate::{memory_inbox, memory_promote, run_git, BlochError, Result};
 
-/// Maximum bytes accepted for one JSON-RPC line.
-pub const RPC_MAX_LINE_BYTES: usize = 1_048_576;
+/// Maximum bytes accepted for one JSON-RPC line. The bound itself
+/// is owned by the era guard since v0.4; this name is kept as the
+/// server's public handle on it.
+pub const RPC_MAX_LINE_BYTES: usize = crate::guard::MAX_LINE_BYTES;
 /// Maximum characters accepted for a search query.
 pub const SEARCH_QUERY_MAX: usize = 256;
 /// Maximum results returned by one search call.
@@ -1491,191 +1505,188 @@ fn evidence_resolves(root: &Path, evidence: &str) -> bool {
 // JSON-RPC transport (stdio, hand-rolled, dual-era)
 // ---------------------------------------------------------------------------
 
-fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
-    serde_json::json!({
-        "jsonrpc": "2.0", "id": id,
-        "error": {"code": code, "message": message}
-    })
+// ---------------------------------------------------------------------------
+// rmcp handler (v0.4): framing only. The domain logic above — index,
+// lane law, gated writes, `call_tool` — is untouched by the SDK swap.
+// ---------------------------------------------------------------------------
+
+/// The rmcp handler: a thin framing shell over [`McpServer`].
+///
+/// The domain server is stateful (`&mut self`: the index rebuilds,
+/// gated writes mutate files) and the hand-rolled transport served
+/// strictly sequentially; a mutex preserves exactly that execution
+/// contract under the SDK's concurrent dispatch. A poisoned lock is
+/// recovered rather than propagated: the panic that poisoned it has
+/// already been reported by the panicking call, and the domain
+/// server's state is file-backed and rebuildable.
+pub struct BlochHandler {
+    server: Arc<Mutex<McpServer>>,
 }
 
-fn rpc_result(id: serde_json::Value, result: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"jsonrpc": "2.0", "id": id, "result": result})
-}
-
-/// Handle one parsed JSON-RPC request. Returns `None` for notifications
-/// (no response). Tool failures are MCP `isError` results, not RPC
-/// errors; malformed requests and unknown methods are RPC errors with
-/// typed codes (-32700/-32600/-32601).
-pub fn handle_rpc(server: &mut McpServer, req: &serde_json::Value) -> Option<serde_json::Value> {
-    if req.is_array() {
-        return Some(rpc_error(
-            serde_json::Value::Null,
-            -32600,
-            "batch_not_supported: JSON-RPC batches are not accepted",
-        ));
-    }
-    if !req.is_object() {
-        return Some(rpc_error(
-            serde_json::Value::Null,
-            -32600,
-            "invalid_request: request must be a JSON object",
-        ));
-    }
-    let method = match req.get("method").and_then(|m| m.as_str()) {
-        Some(m) => m.to_string(),
-        None => {
-            return Some(rpc_error(
-                serde_json::Value::Null,
-                -32600,
-                "invalid_request: missing method",
-            ))
+impl BlochHandler {
+    /// Wrap a built domain server for SDK serving.
+    pub fn new(server: McpServer) -> BlochHandler {
+        BlochHandler {
+            server: Arc::new(Mutex::new(server)),
         }
+    }
+}
+
+/// The served tool surface as rmcp [`Tool`] values, converted from
+/// the hand-written definitions so the wire payload cannot drift
+/// from [`tool_definitions`]. Conversion failure is a build-time
+/// class bug (the definitions are compiled in), surfaced as an
+/// internal error, never a silent drop.
+fn rmcp_tools() -> std::result::Result<Vec<Tool>, String> {
+    let definitions = tool_definitions();
+    let mut tools = Vec::new();
+    for def in definitions.as_array().cloned().unwrap_or_default() {
+        let tool: Tool =
+            serde_json::from_value(def).map_err(|e| format!("tool definition: {e}"))?;
+        tools.push(tool);
+    }
+    Ok(tools)
+}
+
+impl ServerHandler for BlochHandler {
+    /// Modern era only: `server/discover` advertises exactly this
+    /// one version and the SDK validates every request's `_meta`
+    /// against it.
+    fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
+        Cow::Borrowed(&[ProtocolVersion::V_2026_07_28])
+    }
+
+    fn get_info(&self) -> RmcpServerConfig {
+        RmcpServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new("bloch", env!("CARGO_PKG_VERSION")))
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<ListToolsResult, ErrorData> {
+        let tools = rmcp_tools()
+            .map_err(|e| ErrorData::internal_error(format!("internal_error: {e}"), None))?;
+        Ok(ListToolsResult {
+            tools,
+            ..Default::default()
+        })
+    }
+
+    /// Tool failures stay MCP `isError` results (never RPC errors),
+    /// with the same payloads the hand-rolled transport produced:
+    /// pretty-printed JSON text + `structuredContent` on success,
+    /// the typed refusal message on failure. The one addition is
+    /// the modern spec's `resultType` discriminator, set by the
+    /// SDK constructors.
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> std::result::Result<CallToolResponse, ErrorData> {
+        let args = request
+            .arguments
+            .map(serde_json::Value::Object)
+            .unwrap_or_else(|| serde_json::json!({}));
+        let outcome = {
+            let mut server = self
+                .server
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            server.call_tool(&request.name, &args)
+        };
+        match outcome {
+            Ok(value) => {
+                let text = serde_json::to_string_pretty(&value).unwrap_or_default();
+                let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+                result.structured_content = Some(value);
+                Ok(result.into())
+            }
+            Err(msg) => Ok(CallToolResult::error(vec![ContentBlock::text(msg)]).into()),
+        }
+    }
+}
+
+/// Duplex buffer between the era guard and the SDK service. The
+/// SDK consumes incrementally, so this only needs to cover
+/// request/response bursts, not whole payloads.
+const DUPLEX_BUFFER_BYTES: usize = 1024 * 1024;
+
+/// Serve until stdin EOF: the era guard owns stdio, the SDK
+/// service sits behind an in-process duplex, and a pump copies
+/// its responses back to stdout through the same lock the guard
+/// writes with. The `RunningService` is kept alive on
+/// `waiting()` for the whole session — dropping it would close
+/// the server after the first request.
+async fn serve_modern(handler: BlochHandler) -> std::io::Result<()> {
+    let (client_side, server_side) = tokio::io::duplex(DUPLEX_BUFFER_BYTES);
+    let (server_read, server_write) = tokio::io::split(server_side);
+    let (client_read, client_write) = tokio::io::split(client_side);
+    let stdout: crate::guard::SharedStdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
+
+    let ordering = crate::guard::Ordering::new();
+    let serve = tokio::spawn(async move {
+        let transport = AsyncRwTransport::new_server(server_read, server_write);
+        match handler.serve(transport).await {
+            Ok(running) => running
+                .waiting()
+                .await
+                .map(|_| ())
+                .map_err(|e| std::io::Error::other(e.to_string())),
+            // The client closed the connection before selecting a
+            // lifecycle (a probe, a spawn check, a client that only
+            // ever wanted the refusal): bare EOF is a clean end of
+            // session, as it was when the transport was hand-rolled.
+            Err(rmcp::service::ServerInitializeError::ConnectionClosed(_)) => Ok(()),
+            Err(e) => Err(std::io::Error::other(e.to_string())),
+        }
+    });
+    let mut pump = tokio::spawn(crate::guard::pump(
+        client_read,
+        Arc::clone(&stdout),
+        Arc::clone(&ordering),
+    ));
+
+    // When stdin reaches EOF the guard shuts the duplex write side
+    // down, which ends the SDK service; the pump ends when the
+    // service's transport drops. The pump wait is bounded as a
+    // backstop: a response still in flight when the service ends
+    // gets its chance to drain, but a wedged pump cannot hang exit.
+    let guard_result = crate::guard::run(tokio::io::stdin(), client_write, stdout, ordering).await;
+    let serve_result = match serve.await {
+        Ok(result) => result,
+        Err(e) => Err(std::io::Error::other(e.to_string())),
     };
-    let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-    let is_notification = req.get("id").is_none();
-    if is_notification {
-        // Notifications (notifications/initialized, notifications/cancelled,
-        // ...) never get a response.
-        return None;
+    if tokio::time::timeout(std::time::Duration::from_secs(2), &mut pump)
+        .await
+        .is_err()
+    {
+        pump.abort();
     }
-    let params = req
-        .get("params")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
-    match method.as_str() {
-        "initialize" => {
-            let negotiated = params
-                .get("protocolVersion")
-                .and_then(|v| v.as_str())
-                .unwrap_or("2025-06-18")
-                .to_string();
-            Some(rpc_result(
-                id,
-                serde_json::json!({
-                    "capabilities": {"tools": {}},
-                    "protocolVersion": negotiated,
-                    "serverInfo": {
-                        "name": "bloch",
-                        "version": env!("CARGO_PKG_VERSION")
-                    }
-                }),
-            ))
-        }
-        "server/discover" => Some(rpc_result(
-            id,
-            serde_json::json!({
-                "capabilities": {"tools": {}},
-                "protocolVersion": "2026-07-28",
-                "serverInfo": {
-                    "name": "bloch",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }),
-        )),
-        "ping" => Some(rpc_result(id, serde_json::json!({}))),
-        "tools/list" => Some(rpc_result(
-            id,
-            serde_json::json!({"tools": tool_definitions()}),
-        )),
-        "tools/call" => {
-            let name = match params.get("name").and_then(|n| n.as_str()) {
-                Some(n) => n.to_string(),
-                None => {
-                    return Some(rpc_error(
-                        id,
-                        -32602,
-                        "invalid_params: tools/call requires params.name",
-                    ))
-                }
-            };
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({}));
-            if !args.is_object() {
-                return Some(rpc_error(
-                    id,
-                    -32602,
-                    "invalid_params: tools/call arguments must be an object",
-                ));
-            }
-            match server.call_tool(&name, &args) {
-                Ok(value) => Some(rpc_result(
-                    id,
-                    serde_json::json!({
-                        "content": [{
-                            "text": serde_json::to_string_pretty(&value)
-                                .unwrap_or_default(),
-                            "type": "text"
-                        }],
-                        "isError": false,
-                        "structuredContent": value
-                    }),
-                )),
-                Err(msg) => Some(rpc_result(
-                    id,
-                    serde_json::json!({
-                        "content": [{"text": msg, "type": "text"}],
-                        "isError": true
-                    }),
-                )),
-            }
-        }
-        _ => Some(rpc_error(
-            id,
-            -32601,
-            &format!("method_not_found: {}", method),
-        )),
-    }
+    guard_result.and(serve_result)
 }
 
 /// Run the stdio MCP server until EOF on stdin.
 ///
 /// stdout is the protocol channel — diagnostics go to stderr only.
-/// Lines over [`RPC_MAX_LINE_BYTES`] are refused with a typed error and
-/// the server keeps serving.
+/// Lines over [`RPC_MAX_LINE_BYTES`] are refused by the era guard
+/// with a typed error and the server keeps serving. The domain
+/// server is built synchronously (it indexes the roots); only the
+/// framing runs on the async runtime, so the CLI's synchronous
+/// command paths are untouched.
 pub fn serve_stdio(config: ServerConfig) -> Result<()> {
-    let mut server = McpServer::new(config)?;
+    let server = McpServer::new(config)?;
     eprintln!(
         "bloch: MCP server ready ({} repos, {} entries, {} lessons)",
         server.index.repos.len(),
         server.index.entries.len(),
         server.index.lessons.len()
     );
-    let stdin = std::io::stdin();
-    let mut reader = stdin.lock();
-    let stdout = std::io::stdout();
-    let mut writer = stdout.lock();
-    loop {
-        let mut line = String::new();
-        let n = reader.read_line(&mut line).map_err(BlochError::Io)?;
-        if n == 0 {
-            break;
-        }
-        let response = if line.len() > RPC_MAX_LINE_BYTES {
-            Some(rpc_error(
-                serde_json::Value::Null,
-                -32600,
-                "payload_too_large: JSON-RPC line exceeds the size limit",
-            ))
-        } else if line.trim().is_empty() {
-            None
-        } else {
-            match serde_json::from_str::<serde_json::Value>(line.trim()) {
-                Ok(req) => handle_rpc(&mut server, &req),
-                Err(e) => Some(rpc_error(
-                    serde_json::Value::Null,
-                    -32700,
-                    &format!("parse_error: {}", e),
-                )),
-            }
-        };
-        if let Some(resp) = response {
-            let text = serde_json::to_string(&resp).unwrap_or_default();
-            writeln!(writer, "{}", text).map_err(BlochError::Io)?;
-            writer.flush().map_err(BlochError::Io)?;
-        }
-    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(serve_modern(BlochHandler::new(server)))?;
     Ok(())
 }
 
@@ -1787,12 +1798,30 @@ mod tests {
         .unwrap()
     }
 
+    /// Drive one tool call and shape the outcome exactly as the
+    /// wire presents it (text content + structuredContent on
+    /// success, isError text on failure), so the domain assertions
+    /// below read unchanged from the hand-rolled era. Wire framing
+    /// itself is gated in `crate::guard` tests and `tests/era.rs`.
     fn call(server: &mut McpServer, name: &str, args: serde_json::Value) -> serde_json::Value {
-        let req = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-            "params": {"name": name, "arguments": args}
-        });
-        handle_rpc(server, &req).expect("rpc response")
+        match server.call_tool(name, &args) {
+            Ok(value) => serde_json::json!({
+                "result": {
+                    "content": [{
+                        "text": serde_json::to_string_pretty(&value).unwrap_or_default(),
+                        "type": "text"
+                    }],
+                    "isError": false,
+                    "structuredContent": value
+                }
+            }),
+            Err(msg) => serde_json::json!({
+                "result": {
+                    "content": [{"text": msg, "type": "text"}],
+                    "isError": true
+                }
+            }),
+        }
     }
 
     fn result_text(resp: &serde_json::Value) -> String {
@@ -1809,28 +1838,13 @@ mod tests {
     // --- validation -------------------------------------------------------
 
     #[test]
-    fn rpc_initialize_and_tools_list() {
-        let fx = fixture();
-        let mut srv = server(&fx);
-        let resp = handle_rpc(
-            &mut srv,
-            &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
-        )
-        .unwrap();
-        assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(resp["result"]["serverInfo"]["name"], "bloch");
-        let resp = handle_rpc(
-            &mut srv,
-            &serde_json::json!({"jsonrpc":"2.0","id":2,"method":"server/discover","params":{}}),
-        )
-        .unwrap();
-        assert_eq!(resp["result"]["protocolVersion"], "2026-07-28");
-        let resp = handle_rpc(
-            &mut srv,
-            &serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}),
-        )
-        .unwrap();
-        let tools = resp["result"]["tools"].as_array().unwrap();
+    fn tool_definitions_surface() {
+        // The served surface, asserted on the definitions the SDK
+        // handler converts from. Era negotiation (initialize
+        // refusal, discover) is wire framing: gated in
+        // `crate::guard` tests and `tests/era.rs`.
+        let tools = tool_definitions();
+        let tools = tools.as_array().unwrap();
         assert_eq!(tools.len(), 11);
         for t in tools {
             assert!(
@@ -1856,13 +1870,39 @@ mod tests {
         ] {
             assert!(names.contains(&expected), "missing {}", expected);
         }
-        // Notifications get no response.
-        assert!(handle_rpc(
-            &mut srv,
-            &serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})
-        )
-        .is_none());
-        let _ = fs::remove_dir_all(&fx.base);
+    }
+
+    /// Canonical JSON (object keys sorted recursively) for
+    /// order-insensitive payload comparison.
+    fn canonical(value: &serde_json::Value) -> String {
+        fn sort(value: &serde_json::Value) -> serde_json::Value {
+            match value {
+                serde_json::Value::Object(map) => {
+                    let mut pairs: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                    pairs.sort_by(|a, b| a.0.cmp(b.0));
+                    let mut out = serde_json::Map::new();
+                    for (k, v) in pairs {
+                        out.insert(k.clone(), sort(v));
+                    }
+                    serde_json::Value::Object(out)
+                }
+                serde_json::Value::Array(items) => {
+                    serde_json::Value::Array(items.iter().map(sort).collect())
+                }
+                other => other.clone(),
+            }
+        }
+        serde_json::to_string(&sort(value)).unwrap()
+    }
+
+    #[test]
+    fn rmcp_tools_match_definitions() {
+        // The SDK-served surface must be the definitions, exactly:
+        // same tools, same order, same schemas and annotations
+        // under canonical comparison. This is the in-suite half of
+        // the migration parity gate (the wire half is the probe).
+        let served = serde_json::to_value(rmcp_tools().unwrap()).unwrap();
+        assert_eq!(canonical(&served), canonical(&tool_definitions()));
     }
 
     #[test]
@@ -2325,26 +2365,15 @@ mod tests {
     }
 
     #[test]
-    fn malformed_rpc_and_unknown_things() {
+    fn unknown_tool_and_missing_entry_errors() {
+        // The wire-framing half of the pre-migration
+        // `malformed_rpc_and_unknown_things` (non-object frames,
+        // batches, unknown methods) moved with the framing: guard
+        // tests + `tests/era.rs`. What remains here is the domain
+        // half: unknown tools and missing entries are typed
+        // isError results, not crashes.
         let fx = fixture();
         let mut srv = server(&fx);
-        let resp = handle_rpc(&mut srv, &serde_json::json!("just a string")).unwrap();
-        assert_eq!(resp["error"]["code"], -32600);
-        let resp = handle_rpc(
-            &mut srv,
-            &serde_json::json!({"jsonrpc":"2.0","id":1,"method":"nope/nope"}),
-        )
-        .unwrap();
-        assert_eq!(resp["error"]["code"], -32601);
-        let resp = handle_rpc(
-            &mut srv,
-            &serde_json::json!([{"jsonrpc":"2.0","id":1,"method":"ping"}]),
-        )
-        .unwrap();
-        assert!(resp["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("batch_not_supported"));
         let resp = call(&mut srv, "memory_frobnicate", serde_json::json!({}));
         assert!(is_error(&resp));
         assert!(result_text(&resp).contains("unknown_tool"));

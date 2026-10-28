@@ -10,6 +10,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Published to crates.io as package `blochs` (the name `bloch` was taken in Oct 2026); the library and binary remain named `bloch`.
 
+## [0.4.0] - 2026-10-27
+
+### Changed
+- `bloch serve` now runs on the rmcp SDK and speaks the modern MCP
+  protocol era only (2026-07-28): first contact is `server/discover`,
+  and legacy `initialize` handshakes are refused with a typed error
+  naming the supported protocol versions. The 11-tool surface —
+  names, input schemas, annotations, and behavior — is unchanged,
+  as are all CLI commands; only the stdio framing layer moved.
+
 ## [0.3.0] - 2026-10-27
 
 ### Added

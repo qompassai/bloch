@@ -1,6 +1,6 @@
 [package]
 name = "blochs"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Ranked, budgeted codebase maps for coding agents with session handoff fidelity"
 license = "Apache-2.0"
@@ -35,6 +35,14 @@ walkdir = "2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# rmcp is pinned to the fleet version (D-113 standardization): one
+# SDK version across every estate server; bumps are single fleet
+# events. As of 0.4.0 the server speaks the modern protocol era
+# only (2026-07-28); see src/guard.rs. D-113 explicitly overrides
+# this crate's former no-new-deps rule for the server module; the
+# CLI's synchronous paths gain no async dependency surface.
+rmcp = { version = "=3.8.0", features = ["server", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "io-std", "sync", "time"] }
 clap = { version = "4", features = ["derive"] }
 thiserror = "1"
 scip = "0.10.0"

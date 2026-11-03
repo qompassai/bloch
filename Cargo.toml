@@ -1,6 +1,6 @@
 [package]
 name = "blochs"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2021"
 description = "Ranked, budgeted codebase maps for coding agents with session handoff fidelity"
 license = "Apache-2.0"
@@ -10,7 +10,7 @@ documentation = "https://docs.rs/bloch"
 readme = "README.md"
 keywords = ["codebase", "agents", "mapping", "tree-sitter", "handoff"]
 categories = ["development-tools"]
-authors = ["Matt Porter <map@qompass.ai>"]
+authors = ["Qompass AI"]
 exclude = [".github/"]
 
 [lib]

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-03
+
+### Fixed
+- Crate metadata: `authors` corrected to the studio name (Qompass AI)
+  per the D-489 name rule; the 0.4.0 crates.io record carries the
+  pre-correction metadata, which crates.io cannot edit in place.
+  No code changes.
+
+
 ### Changed
 - Published to crates.io as package `blochs` (the name `bloch` was taken in Oct 2026); the library and binary remain named `bloch`.
 

@@ -260,7 +260,7 @@ enum MemoryOp {
         #[arg(long, default_value = "agent")]
         agent: String,
     },
-    /// Promote an inbox entry to a curated memory file
+    /// Promote an inbox entry to a curated memory file (refuses candidates lacking origin_lane/content_label frontmatter, D-1030)
     Promote {
         /// Inbox file name (e.g. 1234567890-agent-topic.md)
         file: String,

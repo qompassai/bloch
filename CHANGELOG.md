@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Birth-metadata gate (D-1030): `memory_promote` now refuses any inbox
+  candidate whose own frontmatter lacks a parseable `origin_lane` or
+  `content_label` (`unlabeled_candidate` error naming the missing
+  fields). No unlabeled promotions, ever; the fail-closed label
+  defaults still govern reads only.
+
 ## [0.4.1] - 2026-11-03
 
 ### Fixed

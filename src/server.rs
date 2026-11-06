@@ -738,7 +738,7 @@ pub fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "memory_promote",
-            "description": "Gated write. Promote an inbox entry to a curated memory file (decisions.md|patterns.md|current.md|lessons.md). Gate act: promoter must be pax or owner, never the proposer; cited evidence must resolve (repo-relative file or commit:<sha>). An nsfw->sfw reclassification is possible only here, with reclassify_evidence.",
+            "description": "Gated write. Promote an inbox entry to a curated memory file (decisions.md|patterns.md|current.md|lessons.md). Gate act: promoter must be pax or owner, never the proposer; cited evidence must resolve (repo-relative file or commit:<sha>). Birth-metadata gate (D-1030): a candidate whose frontmatter lacks origin_lane or content_label is refused (unlabeled_candidate). An nsfw->sfw reclassification is possible only here, with reclassify_evidence.",
             "inputSchema": obj(serde_json::json!({
                 "repo": s("Repo name"),
                 "file": s("Inbox file name"),

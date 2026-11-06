@@ -1682,6 +1682,36 @@ pub fn parse_label_frontmatter(text: &str, origin_fallback: Lane) -> LabelStamp 
     }
 }
 
+/// Birth-metadata gate (D-1030): the label fields a memory candidate
+/// must carry in its own frontmatter before it may be promoted.
+/// Unlike `parse_label_frontmatter`, nothing is defaulted here — a
+/// field that is absent, or present with an unparseable value, is
+/// missing. Returns the missing field names in canonical order
+/// (`origin_lane` before `content_label`); an empty vector means the
+/// candidate carries its birth metadata. Scans the same bounded
+/// opening window as `parse_label_frontmatter` (24 lines), so the
+/// gate sees exactly what the label parser sees.
+pub fn missing_birth_labels(text: &str) -> Vec<&'static str> {
+    let mut origin_seen = false;
+    let mut label_seen = false;
+    for line in text.lines().take(24) {
+        let t = line.trim();
+        if let Some(v) = t.strip_prefix("origin_lane:") {
+            origin_seen = Lane::parse(v).is_some();
+        } else if let Some(v) = t.strip_prefix("content_label:") {
+            label_seen = ContentLabel::parse(v).is_some();
+        }
+    }
+    let mut missing = Vec::new();
+    if !origin_seen {
+        missing.push("origin_lane");
+    }
+    if !label_seen {
+        missing.push("content_label");
+    }
+    missing
+}
+
 // ---------------------------------------------------------------------------
 // Time helpers (no chrono dependency: civil-date conversion, UTC)
 // ---------------------------------------------------------------------------
@@ -4071,6 +4101,37 @@ mod tests {
         let st = roadmap_status(&root).unwrap();
         assert_eq!(st.total, 1, "dropped tasks leave the denominator");
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_birth_labels_gate() {
+        // Fully labelled (estate spelling and generic spelling) passes.
+        let full = "---\norigin_lane: qompassai\ncontent_label: sfw\nevidence: x\n---\n# T\n";
+        assert!(missing_birth_labels(full).is_empty());
+        let generic = "---\norigin_lane: restricted\ncontent_label: nsfw\n---\n# T\n";
+        assert!(missing_birth_labels(generic).is_empty());
+        // Nothing labelled: both fields missing, canonical order.
+        assert_eq!(
+            missing_birth_labels("# T\n\nbody\n"),
+            vec!["origin_lane", "content_label"]
+        );
+        // One field only: the other is named.
+        assert_eq!(
+            missing_birth_labels("---\norigin_lane: general\n---\n# T\n"),
+            vec!["content_label"]
+        );
+        // Unparseable values count as missing (no defaulting at the gate).
+        assert_eq!(
+            missing_birth_labels("---\norigin_lane: mars\ncontent_label: maybe\n---\n"),
+            vec!["origin_lane", "content_label"]
+        );
+        // Labels past the parser's 24-line window are not seen.
+        let mut deep = String::new();
+        for _ in 0..24 {
+            deep.push_str("filler\n");
+        }
+        deep.push_str("origin_lane: general\ncontent_label: sfw\n");
+        assert_eq!(missing_birth_labels(&deep).len(), 2);
     }
 
     #[test]

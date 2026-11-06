@@ -2876,6 +2876,21 @@ pub fn memory_promote(root: &Path, file: &str, target: &str) -> Result<String> {
     let src = mem_dir.join("inbox").join(file);
     let content = std::fs::read_to_string(&src)?;
 
+    // Birth-metadata gate (D-1030): promotion refuses any candidate
+    // lacking origin_lane + content_label in its own frontmatter — no
+    // unlabeled promotions, ever. The fail-closed defaults in
+    // parse_label_frontmatter govern reads, never this gate act: a
+    // candidate that does not carry its labels from birth does not
+    // move. Refusal leaves the inbox entry and the target untouched.
+    let missing = missing_birth_labels(&content);
+    if !missing.is_empty() {
+        return Err(BlochError::GitFailed(format!(
+            "unlabeled_candidate: promotion of '{}' refused — missing birth metadata: {}. Label the candidate via memory_propose before promotion.",
+            file,
+            missing.join(", ")
+        )));
+    }
+
     let dest = mem_dir.join(target);
     let existing = std::fs::read_to_string(&dest).unwrap_or_default();
     let merged = if existing.is_empty() {
@@ -3282,7 +3297,7 @@ mod tests {
         fs::create_dir_all(mem_dir.join("inbox")).unwrap();
         fs::write(
             mem_dir.join("inbox").join("123-agent-test.md"),
-            "new insight",
+            "---\norigin_lane: general\ncontent_label: sfw\nevidence: unit test\n---\n\nnew insight",
         )
         .unwrap();
         fs::write(mem_dir.join("decisions.md"), "old decision").unwrap();
@@ -3300,6 +3315,55 @@ mod tests {
         assert!(memory_promote(&root, "x.md", "evil.md").is_err());
 
         assert!(memory_promote(&root, "../evil.md", "decisions.md").is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_promote_refuses_unlabeled_candidate() {
+        let root = tmp_root("promote-gate");
+        let mem_dir = root.join(".ai").join("memory");
+        fs::create_dir_all(mem_dir.join("inbox")).unwrap();
+        fs::write(mem_dir.join("decisions.md"), "old decision").unwrap();
+
+        // No frontmatter at all: refused, nothing moves, nothing merges.
+        fs::write(
+            mem_dir.join("inbox").join("123-agent-bare.md"),
+            "new insight",
+        )
+        .unwrap();
+        let err = memory_promote(&root, "123-agent-bare.md", "decisions.md").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("unlabeled_candidate"), "{}", msg);
+        assert!(msg.contains("origin_lane"), "{}", msg);
+        assert!(msg.contains("content_label"), "{}", msg);
+        assert!(mem_dir.join("inbox").join("123-agent-bare.md").exists());
+        assert!(!mem_dir.join("archive").join("123-agent-bare.md").exists());
+        assert_eq!(
+            fs::read_to_string(mem_dir.join("decisions.md")).unwrap(),
+            "old decision"
+        );
+
+        // One label only: refused, naming the missing field.
+        fs::write(
+            mem_dir.join("inbox").join("124-agent-half.md"),
+            "---\norigin_lane: general\n---\n\nnew insight",
+        )
+        .unwrap();
+        let err = memory_promote(&root, "124-agent-half.md", "decisions.md").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("unlabeled_candidate"), "{}", msg);
+        assert!(msg.contains("content_label"), "{}", msg);
+        assert!(mem_dir.join("inbox").join("124-agent-half.md").exists());
+
+        // Fully labelled: the same gate lets the promotion through.
+        fs::write(
+            mem_dir.join("inbox").join("125-agent-full.md"),
+            "---\norigin_lane: general\ncontent_label: sfw\nevidence: unit test\n---\n\nnew insight",
+        )
+        .unwrap();
+        let msg = memory_promote(&root, "125-agent-full.md", "decisions.md").unwrap();
+        assert!(msg.contains("promoted"), "{}", msg);
 
         let _ = fs::remove_dir_all(&root);
     }

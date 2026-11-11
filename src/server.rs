@@ -31,6 +31,7 @@ use rmcp::service::RequestContext;
 use rmcp::transport::async_rw::AsyncRwTransport;
 use rmcp::{ErrorData, RoleServer, ServerHandler, ServiceExt};
 
+use crate::outcome::{append_outcome, read_outcomes, OutcomeRecord};
 use crate::roadmap::{
     attempt_history, decide_content_label, label_frontmatter, now_epoch, parse_label_frontmatter,
     read_attempts, repo_lane, roadmap_status, ContentLabel, LabelStamp, Lane, LiveAttempt,
@@ -159,6 +160,8 @@ pub struct ServerConfig {
     pub leases_path: Option<PathBuf>,
     /// appa.toml-style policy file.
     pub policy_path: Option<PathBuf>,
+    /// Outcome store (BL-1): append-only JSONL of fleet outcome records.
+    pub outcomes_path: Option<PathBuf>,
     /// Registered repo roots.
     pub roots: Vec<PathBuf>,
 }
@@ -671,10 +674,10 @@ fn snippet(text: &str, tokens: &[String]) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Tool surface (11 tools, annotations from birth)
+// Tool surface (13 tools, annotations from birth)
 // ---------------------------------------------------------------------------
 
-/// The 11 tool definitions with full schemas and MCP annotations.
+/// The 13 tool definitions with full schemas and MCP annotations.
 /// Read tools are `readOnlyHint: true`; the two gated writes and the
 /// inbox write declare their own access class in their descriptions.
 pub fn tool_definitions() -> serde_json::Value {
@@ -801,6 +804,34 @@ pub fn tool_definitions() -> serde_json::Value {
             "description": "Read. The fleet view of roadmap_state: every bloch-initialised repo's v1 progress in one call.",
             "inputSchema": obj(serde_json::json!({}), vec![]),
             "annotations": read
+        },
+        {
+            "name": "outcome_record",
+            "description": "Write. Append one finished run's outcome record (INDEX 2.3) to the outcome store. Lane labels enforced at write: a record missing origin_lane, content_label, or evidence is refused (unlabelled_outcome); a record without a verification strength is refused (missing_verification). Nothing is defaulted at intake.",
+            "inputSchema": obj(serde_json::json!({
+                "outcome_id": s("Unique outcome id (producer-assigned, never reused)"),
+                "server": s("Producing server, e.g. phlow"),
+                "asked": s("What was asked (summary, max 4000 chars)"),
+                "produced": {"type": "array", "description": "Artifacts produced, each with its sha256", "items": {"type": "object", "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "description": "64 lowercase hex chars"}}, "required": ["path", "sha256"], "additionalProperties": false}},
+                "verification": s("Verification strength: self_reported|tool_checked|independently_cross_checked|owner_judged"),
+                "cost": {"type": "object", "description": "Run cost; zero means not metered", "properties": {"wall_secs": {"type": "integer", "minimum": 0}, "tokens": {"type": "integer", "minimum": 0}, "disk_bytes": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+                "skills": {"type": "array", "description": "Skill ids used by the run", "items": {"type": "string"}},
+                "origin_lane": s("Provenance lane from birth: general|restricted"),
+                "content_label": s("Content label from birth: sfw|nsfw"),
+                "evidence": s("Evidence for the content label (required, never empty)")
+            }), vec!["outcome_id", "server", "asked", "verification", "origin_lane", "content_label", "evidence"]),
+            "annotations": write_inbox
+        },
+        {
+            "name": "outcome_list",
+            "description": "Read. Recent outcome records from the store, newest last. Lane-filtered server-side: nsfw-labeled records are never returned to general-only callers. count is the full visible total; outcomes is the bounded tail page.",
+            "inputSchema": obj(serde_json::json!({
+                "server": s("Optional producing-server filter"),
+                "caller": s("Caller name for policy clearance lookup"),
+                "clearance": s("Caller clearance lane: general (default) or restricted"),
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50}
+            }), vec![]),
+            "annotations": read
         }
     ])
 }
@@ -907,6 +938,8 @@ impl McpServer {
             "lessons_search" => self.tool_lessons_search(args),
             "roadmap_state" => self.tool_roadmap_state(args),
             "roadmap_rollup" => self.tool_roadmap_rollup(args),
+            "outcome_record" => self.tool_outcome_record(args),
+            "outcome_list" => self.tool_outcome_list(args),
             _ => Err(format!("unknown_tool: {}", name)),
         }
     }
@@ -1448,6 +1481,60 @@ impl McpServer {
         }))
     }
 
+    fn tool_outcome_record(&mut self, args: &serde_json::Value) -> ToolResult {
+        let path = self.config.outcomes_path.clone().ok_or_else(|| {
+            "outcomes_not_configured: no outcome store file configured".to_string()
+        })?;
+        let mut intake = args.clone();
+        if intake.is_object() && intake.get("recorded_at_epoch").is_none() {
+            intake["recorded_at_epoch"] = serde_json::json!(now_epoch());
+        }
+        // The write gate: unlabelled or unverified records are refused
+        // inside from_intake_json; a refusal appends nothing.
+        let record = OutcomeRecord::from_intake_json(&intake)?;
+        append_outcome(&path, &record)?;
+        let mut stored =
+            serde_json::to_value(&record).map_err(|e| format!("invalid_outcome: {e}"))?;
+        stored["lesson_eligible"] = serde_json::json!(record.lesson_eligible());
+        Ok(stored)
+    }
+
+    fn tool_outcome_list(&mut self, args: &serde_json::Value) -> ToolResult {
+        let path = self.config.outcomes_path.clone().ok_or_else(|| {
+            "outcomes_not_configured: no outcome store file configured".to_string()
+        })?;
+        let clearance = self.clearance_for(args);
+        let server_filter = arg_str(args, "server");
+        let limit = arg_limit(args);
+        let all = read_outcomes(&path)?;
+        // Lane law: visibility follows the content label, enforced
+        // server-side; a general-only caller never learns nsfw rows
+        // exist (count covers visible rows only).
+        let visible: Vec<&OutcomeRecord> = all
+            .iter()
+            .filter(|r| clearance.can_see(r.content_label))
+            .filter(|r| {
+                server_filter
+                    .as_deref()
+                    .map(|f| r.server == f)
+                    .unwrap_or(true)
+            })
+            .collect();
+        let count = visible.len();
+        let tail: Vec<serde_json::Value> = visible
+            .iter()
+            .rev()
+            .take(limit)
+            .rev()
+            .filter_map(|r| serde_json::to_value(r).ok())
+            .collect();
+        Ok(serde_json::json!({
+            "count": count,
+            "returned": tail.len(),
+            "outcomes": tail
+        }))
+    }
+
     fn tool_roadmap_state(&mut self, args: &serde_json::Value) -> ToolResult {
         let repo = self.repo_required(args)?.clone();
         self.roadmap_json(&repo)
@@ -1793,6 +1880,7 @@ mod tests {
             ideas_path: Some(fx.ideas.clone()),
             leases_path: None,
             policy_path: Some(policy_path),
+            outcomes_path: Some(fx.base.join("outcomes.jsonl")),
             roots: vec![fx.repo_a.clone(), fx.repo_b.clone()],
         })
         .unwrap()
@@ -1845,7 +1933,7 @@ mod tests {
         // `crate::guard` tests and `tests/era.rs`.
         let tools = tool_definitions();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 13);
         for t in tools {
             assert!(
                 t["annotations"]["readOnlyHint"].is_boolean(),
@@ -1867,6 +1955,8 @@ mod tests {
             "lessons_search",
             "roadmap_state",
             "roadmap_rollup",
+            "outcome_record",
+            "outcome_list",
         ] {
             assert!(names.contains(&expected), "missing {}", expected);
         }
@@ -2361,6 +2451,60 @@ mod tests {
         )
         .unwrap();
         assert!(filed.contains("origin_lane: restricted"), "{}", filed);
+        let _ = fs::remove_dir_all(&fx.base);
+    }
+
+    #[test]
+    fn outcome_record_and_list_enforce_lane_law() {
+        let fx = fixture();
+        let mut srv = server(&fx);
+        let base = serde_json::json!({
+            "outcome_id": "out-1",
+            "server": "phlow",
+            "asked": "run the S1 gate",
+            "produced": [],
+            "verification": "tool_checked",
+            "origin_lane": "general",
+            "content_label": "sfw",
+            "evidence": "gate log checked by the test runner"
+        });
+        // BL-1 gate 1: an unlabelled record is refused, nothing stored.
+        let mut unlabelled = base.clone();
+        unlabelled.as_object_mut().unwrap().remove("content_label");
+        let resp = call(&mut srv, "outcome_record", unlabelled);
+        assert!(is_error(&resp), "{}", result_text(&resp));
+        assert!(result_text(&resp).contains("unlabelled_outcome"));
+        // BL-K3: a record without verification strength is refused.
+        let mut unverified = base.clone();
+        unverified.as_object_mut().unwrap().remove("verification");
+        let resp = call(&mut srv, "outcome_record", unverified);
+        assert!(is_error(&resp));
+        assert!(result_text(&resp).contains("missing_verification"));
+        // A labelled sfw record lands and reports lesson eligibility.
+        let resp = call(&mut srv, "outcome_record", base.clone());
+        assert!(!is_error(&resp), "{}", result_text(&resp));
+        assert_eq!(resp["result"]["structuredContent"]["lesson_eligible"], true);
+        // An nsfw record lands for a restricted-scope producer.
+        let mut nsfw = base.clone();
+        nsfw["outcome_id"] = serde_json::json!("out-2");
+        nsfw["origin_lane"] = serde_json::json!("restricted");
+        nsfw["content_label"] = serde_json::json!("nsfw");
+        let resp = call(&mut srv, "outcome_record", nsfw);
+        assert!(!is_error(&resp), "{}", result_text(&resp));
+        // BL-1 gate 2: the nsfw record is invisible to a general-only
+        // caller (not listed, not counted) and visible with clearance.
+        let resp = call(&mut srv, "outcome_list", serde_json::json!({}));
+        assert!(!is_error(&resp));
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["count"], 1, "{}", result_text(&resp));
+        assert_eq!(sc["outcomes"][0]["outcome_id"], "out-1");
+        let resp = call(
+            &mut srv,
+            "outcome_list",
+            serde_json::json!({"clearance": "restricted"}),
+        );
+        assert!(!is_error(&resp));
+        assert_eq!(resp["result"]["structuredContent"]["count"], 2);
         let _ = fs::remove_dir_all(&fx.base);
     }
 

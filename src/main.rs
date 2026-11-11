@@ -115,6 +115,9 @@ enum Command {
         /// Progress board file (TRACKER.md) for rollup ordering
         #[arg(long)]
         board: Option<PathBuf>,
+        /// Outcome store file (BL-1): append-only JSONL outcome records
+        #[arg(long)]
+        outcomes: Option<PathBuf>,
     },
 }
 
@@ -611,6 +614,7 @@ fn main() {
         leases,
         ideas,
         board,
+        outcomes,
     }) = &args.command
     {
         let roots = if roots.is_empty() {
@@ -623,6 +627,7 @@ fn main() {
             ideas_path: ideas.clone(),
             leases_path: leases.clone(),
             policy_path: policy.clone(),
+            outcomes_path: outcomes.clone(),
             roots,
         };
         if let Err(e) = bloch::server::serve_stdio(config) {

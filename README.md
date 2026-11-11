@@ -2,6 +2,7 @@
 
 Ranked, budgeted codebase maps for coding agents — with session handoff fidelity.
 <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0"></a>
+<a href="https://crates.io/crates/blochs"><img src="https://img.shields.io/crates/v/blochs.svg" alt="crates.io"></a>
 
 Named for the **Bloch sphere**: the geometric map of a qubit's quantum state.
 Just as the Bloch sphere maps the two-dimensional Hilbert space (C²) of

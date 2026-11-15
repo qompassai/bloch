@@ -11,7 +11,11 @@
 //! the fail-closed defaults in [`crate::roadmap`] govern how legacy
 //! unlabelled records are *read*, never what bloch will *accept*.
 //! An outcome without a verification-strength label is likewise
-//! refused (BL-K3). Visibility follows the content label: an
+//! refused (BL-K3), and one without a result is refused too
+//! (`missing_result`, BL-3): verification says how strongly a run's
+//! end was checked, never what that end was — a tool-checked failure
+//! and a tool-checked success are different records. Visibility
+//! follows the content label: an
 //! nsfw-labelled record is invisible to a general-only caller; the
 //! server enforces that through `Clearance::can_see` over
 //! [`OutcomeRecord::content_label`].
@@ -85,6 +89,44 @@ impl VerificationStrength {
     }
 }
 
+/// What the finished run came to (BL-3): the run completed its ask,
+/// it failed, or it was abandoned (killed, timed out, superseded).
+/// Distinct from verification strength on purpose: strength says how
+/// strongly the end was checked, result says what the end was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeResult {
+    /// The run completed what was asked.
+    Ok,
+    /// The run ended in failure (its checks or its task failed).
+    Failed,
+    /// The run was stopped before an end state (killed, timed out,
+    /// superseded); its record exists so the attempt is not invisible.
+    Abandoned,
+}
+
+impl OutcomeResult {
+    /// Stable lowercase name (the wire / store spelling).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OutcomeResult::Ok => "ok",
+            OutcomeResult::Failed => "failed",
+            OutcomeResult::Abandoned => "abandoned",
+        }
+    }
+
+    /// Parse a result name (case-insensitive); anything else is not a
+    /// result and refuses at intake rather than defaulting.
+    pub fn parse(s: &str) -> Option<OutcomeResult> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ok" => Some(OutcomeResult::Ok),
+            "failed" => Some(OutcomeResult::Failed),
+            "abandoned" => Some(OutcomeResult::Abandoned),
+            _ => None,
+        }
+    }
+}
+
 /// One produced artifact: a path plus the SHA-256 of its content, so a
 /// consumer can check the claim without trusting the producer.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,6 +186,8 @@ pub struct OutcomeRecord {
     /// run produced only a verdict.
     #[serde(default)]
     pub produced: Vec<ProducedArtifact>,
+    /// What the run came to (BL-3): ok, failed, or abandoned.
+    pub result: OutcomeResult,
     /// How strongly the result was verified (the ladder).
     #[serde(rename = "verification")]
     pub verification: VerificationStrength,
@@ -226,9 +270,10 @@ impl OutcomeRecord {
     /// object, refusing anything unlabelled. Unlike the read-side
     /// label parsers, NOTHING is defaulted here — a missing or
     /// unparseable `origin_lane`, `content_label`, or `evidence`
-    /// refuses the write (`unlabelled_outcome`), and a missing or
+    /// refuses the write (`unlabelled_outcome`), a missing or
     /// unknown `verification` refuses it too (BL-K3: an outcome
-    /// without a verification-strength label is refused).
+    /// without a verification-strength label is refused), and a
+    /// missing or unknown `result` refuses it as well (BL-3).
     pub fn from_intake_json(value: &serde_json::Value) -> Result<OutcomeRecord, String> {
         let obj = value
             .as_object()
@@ -256,6 +301,12 @@ impl OutcomeRecord {
                 return Err("missing_verification: verification must be one of \
                      self_reported|tool_checked|independently_cross_checked|owner_judged"
                     .to_string());
+            }
+        }
+        match obj.get("result").and_then(|v| v.as_str()) {
+            Some(s) if OutcomeResult::parse(s).is_some() => {}
+            _ => {
+                return Err("missing_result: result must be one of ok|failed|abandoned".to_string());
             }
         }
         let record: OutcomeRecord =
@@ -342,6 +393,7 @@ mod tests {
             "server": "phlow",
             "asked": "run the S1 gate",
             "produced": [{"path": "gate/report.json", "sha256": hash()}],
+            "result": "ok",
             "verification": "tool_checked",
             "cost": {"wall_secs": 42, "tokens": 1200, "disk_bytes": 2048},
             "skills": ["tiger-style-rust"],
@@ -357,6 +409,7 @@ mod tests {
         let rec = OutcomeRecord::from_intake_json(&intake()).unwrap();
         assert_eq!(rec.origin_lane, Lane::General);
         assert_eq!(rec.content_label, ContentLabel::Sfw);
+        assert_eq!(rec.result, OutcomeResult::Ok);
         assert_eq!(rec.verification, VerificationStrength::ToolChecked);
         assert!(rec.lesson_eligible());
         assert!(rec.visible_to_general());
@@ -394,6 +447,44 @@ mod tests {
         v["verification"] = serde_json::json!("vibes");
         let err = OutcomeRecord::from_intake_json(&v).unwrap_err();
         assert!(err.starts_with("missing_verification"), "{err}");
+    }
+
+    #[test]
+    fn intake_records_each_result_distinctly() {
+        // BL-3 validation: all three results land, and a tool-checked
+        // failure is a different record from a tool-checked success —
+        // same strength, different result, both stored as stated.
+        for (spelling, want) in [
+            ("ok", OutcomeResult::Ok),
+            ("failed", OutcomeResult::Failed),
+            ("abandoned", OutcomeResult::Abandoned),
+        ] {
+            let mut v = intake();
+            v["result"] = serde_json::json!(spelling);
+            let rec = OutcomeRecord::from_intake_json(&v).unwrap();
+            assert_eq!(rec.result, want);
+            assert_eq!(rec.verification, VerificationStrength::ToolChecked);
+        }
+        let mut v = intake();
+        v["result"] = serde_json::json!("failed");
+        let failed = OutcomeRecord::from_intake_json(&v).unwrap();
+        let ok = OutcomeRecord::from_intake_json(&intake()).unwrap();
+        assert_ne!(failed, ok);
+        assert_eq!(failed.result.as_str(), "failed");
+    }
+
+    #[test]
+    fn intake_refuses_missing_or_unknown_result() {
+        // BL-3 adversarial: no result, or a word that is not a result,
+        // refuses the write — a result is never defaulted to ok.
+        let mut v = intake();
+        v.as_object_mut().unwrap().remove("result");
+        let err = OutcomeRecord::from_intake_json(&v).unwrap_err();
+        assert!(err.starts_with("missing_result"), "{err}");
+        let mut v = intake();
+        v["result"] = serde_json::json!("passed");
+        let err = OutcomeRecord::from_intake_json(&v).unwrap_err();
+        assert!(err.starts_with("missing_result"), "{err}");
     }
 
     #[test]

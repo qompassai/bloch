@@ -807,19 +807,20 @@ pub fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "outcome_record",
-            "description": "Write. Append one finished run's outcome record (INDEX 2.3) to the outcome store. Lane labels enforced at write: a record missing origin_lane, content_label, or evidence is refused (unlabelled_outcome); a record without a verification strength is refused (missing_verification). Nothing is defaulted at intake.",
+            "description": "Write. Append one finished run's outcome record (INDEX 2.3) to the outcome store. Lane labels enforced at write: a record missing origin_lane, content_label, or evidence is refused (unlabelled_outcome); a record without a verification strength is refused (missing_verification); a record without a result is refused (missing_result). Nothing is defaulted at intake.",
             "inputSchema": obj(serde_json::json!({
                 "outcome_id": s("Unique outcome id (producer-assigned, never reused)"),
                 "server": s("Producing server, e.g. phlow"),
                 "asked": s("What was asked (summary, max 4000 chars)"),
                 "produced": {"type": "array", "description": "Artifacts produced, each with its sha256", "items": {"type": "object", "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "description": "64 lowercase hex chars"}}, "required": ["path", "sha256"], "additionalProperties": false}},
+                "result": s("What the run came to: ok|failed|abandoned"),
                 "verification": s("Verification strength: self_reported|tool_checked|independently_cross_checked|owner_judged"),
                 "cost": {"type": "object", "description": "Run cost; zero means not metered", "properties": {"wall_secs": {"type": "integer", "minimum": 0}, "tokens": {"type": "integer", "minimum": 0}, "disk_bytes": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
                 "skills": {"type": "array", "description": "Skill ids used by the run", "items": {"type": "string"}},
                 "origin_lane": s("Provenance lane from birth: general|restricted"),
                 "content_label": s("Content label from birth: sfw|nsfw"),
                 "evidence": s("Evidence for the content label (required, never empty)")
-            }), vec!["outcome_id", "server", "asked", "verification", "origin_lane", "content_label", "evidence"]),
+            }), vec!["outcome_id", "server", "asked", "result", "verification", "origin_lane", "content_label", "evidence"]),
             "annotations": write_inbox
         },
         {
@@ -1787,8 +1788,19 @@ mod tests {
     use std::fs;
 
     fn tmp_root(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("bloch-server-test-{}-{}", name, std::process::id()));
+        // Unique per call: every fixture() test in this process used
+        // to share one directory keyed only by pid, so parallel tests
+        // deleted each other's fixture trees mid-flight (NotFound
+        // races at fixture setup). The counter keeps each test's tree
+        // its own; the pid still separates concurrent test processes.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "bloch-server-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            n
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -2463,6 +2475,7 @@ mod tests {
             "server": "phlow",
             "asked": "run the S1 gate",
             "produced": [],
+            "result": "ok",
             "verification": "tool_checked",
             "origin_lane": "general",
             "content_label": "sfw",
@@ -2480,6 +2493,12 @@ mod tests {
         let resp = call(&mut srv, "outcome_record", unverified);
         assert!(is_error(&resp));
         assert!(result_text(&resp).contains("missing_verification"));
+        // BL-3: a record without a result is refused, never defaulted.
+        let mut resultless = base.clone();
+        resultless.as_object_mut().unwrap().remove("result");
+        let resp = call(&mut srv, "outcome_record", resultless);
+        assert!(is_error(&resp));
+        assert!(result_text(&resp).contains("missing_result"));
         // A labelled sfw record lands and reports lesson eligibility.
         let resp = call(&mut srv, "outcome_record", base.clone());
         assert!(!is_error(&resp), "{}", result_text(&resp));
@@ -2505,6 +2524,22 @@ mod tests {
         );
         assert!(!is_error(&resp));
         assert_eq!(resp["result"]["structuredContent"]["count"], 2);
+        // BL-3: a failed run records as failed — at the same
+        // verification strength it stays a different record from the
+        // success above, and outcome_list shows the distinction.
+        let mut failed = base.clone();
+        failed["outcome_id"] = serde_json::json!("out-3");
+        failed["result"] = serde_json::json!("failed");
+        let resp = call(&mut srv, "outcome_record", failed);
+        assert!(!is_error(&resp), "{}", result_text(&resp));
+        assert_eq!(resp["result"]["structuredContent"]["result"], "failed");
+        let resp = call(&mut srv, "outcome_list", serde_json::json!({}));
+        assert!(!is_error(&resp));
+        let sc = &resp["result"]["structuredContent"];
+        assert_eq!(sc["count"], 2, "{}", result_text(&resp));
+        assert_eq!(sc["outcomes"][0]["result"], "ok");
+        assert_eq!(sc["outcomes"][1]["outcome_id"], "out-3");
+        assert_eq!(sc["outcomes"][1]["result"], "failed");
         let _ = fs::remove_dir_all(&fx.base);
     }
 

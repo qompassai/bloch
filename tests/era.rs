@@ -195,7 +195,7 @@ fn tools_list_requires_modern_meta() {
         frame["error"]["data"]["supported"],
         serde_json::json!(["2026-07-28"])
     );
-    // Modern _meta: the full 11-tool surface, in definition order.
+    // Modern _meta: the full 13-tool surface, in definition order.
     let modern = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{{META}}}}}"#);
     let frames = srv.exchange(&[modern], 1);
     let tools = by_id(&frames, 2)["result"]["tools"]
@@ -216,7 +216,9 @@ fn tools_list_requires_modern_meta() {
             "idea_register",
             "lessons_search",
             "roadmap_state",
-            "roadmap_rollup"
+            "roadmap_rollup",
+            "outcome_record",
+            "outcome_list"
         ]
     );
     srv.shutdown();

@@ -7,12 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-15
+
+### Added
+- Outcome-record intake (BL-1, D-1266): two new tools,
+  `outcome_record` (write) and `outcome_list` (read), take the
+  surface from 11 to 13 tools. Records land in an append-only JSONL
+  outcome store (serve flag `--outcomes`) with lane law enforced at
+  write: a record missing `origin_lane`, `content_label`, or
+  `evidence` is refused (`unlabelled_outcome`), and one without a
+  verification strength is refused (`missing_verification`). Reads
+  are lane-filtered server-side: nsfw-labeled records are invisible
+  — and uncounted — to general-only callers.
+- Outcome result field (BL-3): every outcome record now carries a
+  required `result` (`ok` | `failed` | `abandoned`), refused at
+  intake when missing or unknown (`missing_result`) and never
+  defaulted. Verification strength says how strongly a run's end was
+  checked; result says what that end was — a tool-checked failure is
+  now a different record from a tool-checked success.
+
 ### Changed
 - Birth-metadata gate (D-1030): `memory_promote` now refuses any inbox
   candidate whose own frontmatter lacks a parseable `origin_lane` or
   `content_label` (`unlabeled_candidate` error naming the missing
   fields). No unlabeled promotions, ever; the fail-closed label
   defaults still govern reads only.
+
+### Fixed
+- Server-test fixture race: every `fixture()` test shared one temp
+  directory keyed only by pid, so parallel test runs deleted each
+  other's fixture trees (intermittent NotFound failures at fixture
+  setup). Each fixture now gets its own directory.
+- The era integration test's expected tool list covers the full
+  13-tool surface; it still asserted the pre-BL-1 11.
 
 ## [0.4.1] - 2026-11-03
 

@@ -152,14 +152,16 @@ bloch serve --root ~/repos/a --root ~/repos/b \
   --policy policy.toml --ideas ~/register/IDEAS.md --board ~/board/TRACKER.md
 ```
 
-11 tools, annotations from birth: `memory_search` / `memory_get`
+13 tools, annotations from birth: `memory_search` / `memory_get`
 (read), `memory_propose` (inbox-only; requires the repo's current
 fencing generation and a live attention lease, verified
 server-side from the policy file), `memory_promote` (curator gate;
 proposer ≠ promoter; evidence must resolve), `tracker_state` /
 `tracker_rollup`, `idea_lookup` / `idea_register` (gated),
 `lessons_search` (cross-repo lessons + attempt aggregates),
-`roadmap_state` / `roadmap_rollup`. Content lanes are enforced in
+`roadmap_state` / `roadmap_rollup`, `outcome_record` /
+`outcome_list` (finished-run outcome records; lane labels enforced
+at write, reads lane-filtered). Content lanes are enforced in
 server code: nsfw-labeled entries are never served to callers whose
 clearance covers only the general lane, and nsfw content cannot be
 proposed into a general-lane repo. The operator's own private memory

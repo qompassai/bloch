@@ -1,0 +1,31 @@
+[package]
+name = "bloch-tui"
+version = "0.1.0"
+edition = "2021"
+description = "Fleet-pattern TUI for bloch: budgeted codebase maps, session handoff, and the lesson-candidate inbox (the fleet lesson sink)"
+license = "Apache-2.0"
+repository = "https://github.com/qompassai/bloch"
+
+[lib]
+name = "bloch_tui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "bloch-tui"
+path = "src/main.rs"
+
+[dependencies]
+# The member's own library: map building, handoff, roadmap/lessons, and
+# the gated lesson machinery (memory_inbox / memory_promote, D-1030).
+bloch = { package = "blochs", path = "../.." }
+# ratatui + crossterm: the fleet TUI pattern's rendering pair (phlow-tui
+# precedent). Panels are pure constructors; tests use TestBackend.
+ratatui = "0.30"
+crossterm = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Standalone crate inside a package (non-workspace) repo: detach from
+# any parent workspace inference. The member repo stays a single
+# package; this crate builds and gates independently.
+[workspace]

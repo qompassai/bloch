@@ -506,11 +506,47 @@ pub fn diff_maps(old: &CachedMap, new: &CachedMap) -> String {
     out
 }
 
+/// Repo-config hardening prefix for every git invocation (CVE-2026-129128
+/// shape): command-line `-c` values override the target repo's own config,
+/// so a hostile repo cannot turn `diff.external`, `core.fsmonitor`,
+/// `core.pager` or `core.hooksPath` into code execution when bloch is
+/// pointed at it. `--no-ext-diff` is added per diff-family call below.
+const GIT_CONFIG_OVERRIDES: [&str; 8] = [
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.pager=cat",
+    "-c",
+    "diff.external=",
+    "-c",
+    "core.hooksPath=/dev/null",
+];
+
+/// Subcommands that generate diffs and would honour an external driver.
+const GIT_DIFF_FAMILY: [&str; 3] = ["diff", "log", "show"];
+
 pub fn run_git(root: &Path, args: &[&str]) -> String {
+    let mut argv: Vec<&str> = Vec::with_capacity(args.len() + 1);
+    if let Some((first, rest)) = args.split_first() {
+        argv.push(first);
+        if GIT_DIFF_FAMILY.contains(first) {
+            argv.push("--no-ext-diff");
+        }
+        argv.extend(rest);
+    }
     Command::new("git")
+        .arg("--no-pager")
         .arg("-C")
         .arg(root)
-        .args(args)
+        .args(GIT_CONFIG_OVERRIDES)
+        .args(&argv)
+        .env("GIT_PAGER", "cat")
+        .env("PAGER", "cat")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_COUNT")
         .output()
         .ok()
         .filter(|o| o.status.success())

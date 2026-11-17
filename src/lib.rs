@@ -2895,6 +2895,10 @@ pub fn memory_inbox(root: &Path, agent: &str, topic: &str, content: &str) -> Res
 /// Contract: target must be decisions.md, patterns.md, current.md, or
 /// lessons.md (the roadmap learning-loop target, v0.2).
 /// Rejects path traversal in file name.
+/// Gates, in order: the D-1030 birth-metadata gate (the candidate must
+/// carry parseable origin_lane + content_label from birth), then the
+/// SPEC §9 lane wall (a candidate whose effective label is nsfw may
+/// not be promoted into a general-lane repo).
 pub fn memory_promote(root: &Path, file: &str, target: &str) -> Result<String> {
     const ALLOWED: &[&str] = &["decisions.md", "patterns.md", "current.md", "lessons.md"];
     if !ALLOWED.contains(&target) {
@@ -2927,6 +2931,26 @@ pub fn memory_promote(root: &Path, file: &str, target: &str) -> Result<String> {
             file,
             missing.join(", ")
         )));
+    }
+
+    // Lane wall (SPEC §9): the birth gate proves the candidate carries
+    // labels; this check proves they may land HERE. The candidate's
+    // effective label is read with the same fail-closed parser that
+    // governs visibility everywhere else — a restricted-origin
+    // candidate whose sfw claim carries no evidence reads as nsfw —
+    // and an nsfw-effective candidate may not be promoted into a
+    // general-lane repo, exactly as memory_propose refuses to file one
+    // there. The target lane is the repo's own configured lane
+    // (repo_lane: .ai/lane stamp, else the roadmap header, else
+    // general), the same source the server index uses for repo.lane.
+    // Refusal leaves the inbox entry and the target untouched.
+    let target_lane = repo_lane(root);
+    let stamp = parse_label_frontmatter(&content, target_lane);
+    if target_lane == Lane::General && stamp.content_label == ContentLabel::Nsfw {
+        return Err(BlochError::GitFailed(
+            "lane_wall_refusal: nsfw-labeled content may not be promoted into a general-lane repo"
+                .to_string(),
+        ));
     }
 
     let dest = mem_dir.join(target);
@@ -3403,6 +3427,113 @@ mod tests {
         let msg = memory_promote(&root, "125-agent-full.md", "decisions.md").unwrap();
         assert!(msg.contains("promoted"), "{}", msg);
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_promote_lane_wall_allows_compatible_labels() {
+        // Validation (§9.1): the wall is a compatibility check, not an
+        // nsfw ban. An sfw record of restricted origin WITH evidence
+        // flows into a general-lane repo (no lane stamp: general).
+        let root = tmp_root("promote-wall-ok");
+        let mem_dir = root.join(".ai").join("memory");
+        fs::create_dir_all(mem_dir.join("inbox")).unwrap();
+        fs::write(
+            mem_dir.join("inbox").join("123-agent-transfer.md"),
+            "---\norigin_lane: restricted\ncontent_label: sfw\nevidence: lesson text is a rust build fix; reviewed\n---\n\nportable lesson",
+        )
+        .unwrap();
+        let msg = memory_promote(&root, "123-agent-transfer.md", "lessons.md").unwrap();
+        assert!(msg.contains("promoted"), "{}", msg);
+        assert!(mem_dir
+            .join("archive")
+            .join("123-agent-transfer.md")
+            .exists());
+        let lessons = fs::read_to_string(mem_dir.join("lessons.md")).unwrap();
+        assert!(lessons.contains("portable lesson"), "{}", lessons);
+        let _ = fs::remove_dir_all(&root);
+
+        // An nsfw record promotes into a restricted-lane repo.
+        let root = tmp_root("promote-wall-nsfw-ok");
+        let mem_dir = root.join(".ai").join("memory");
+        fs::create_dir_all(mem_dir.join("inbox")).unwrap();
+        fs::write(root.join(".ai").join("lane"), "lane: restricted\n").unwrap();
+        fs::write(
+            mem_dir.join("inbox").join("123-agent-adult.md"),
+            "---\norigin_lane: restricted\ncontent_label: nsfw\nevidence: owner review\n---\n\nadult scene lesson",
+        )
+        .unwrap();
+        let msg = memory_promote(&root, "123-agent-adult.md", "lessons.md").unwrap();
+        assert!(msg.contains("promoted"), "{}", msg);
+        assert!(mem_dir.join("archive").join("123-agent-adult.md").exists());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_promote_lane_wall_refuses_nsfw_into_general() {
+        // Adversarial: the hand-planted exploit — a fully labelled
+        // nsfw candidate placed directly in a general-lane repo's
+        // inbox, promoted without memory_propose ever seeing it. The
+        // birth gate passes it (its metadata is complete); the lane
+        // wall must refuse it, leaving inbox and target untouched.
+        let root = tmp_root("promote-wall-exploit");
+        let mem_dir = root.join(".ai").join("memory");
+        fs::create_dir_all(mem_dir.join("inbox")).unwrap();
+        fs::write(mem_dir.join("lessons.md"), "curated lessons").unwrap();
+        fs::write(
+            mem_dir.join("inbox").join("123-agent-planted.md"),
+            "---\norigin_lane: restricted\ncontent_label: nsfw\nevidence: owner review\n---\n\nadult scene lesson",
+        )
+        .unwrap();
+        let err = memory_promote(&root, "123-agent-planted.md", "lessons.md").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("lane_wall_refusal"), "{}", msg);
+        assert!(mem_dir.join("inbox").join("123-agent-planted.md").exists());
+        assert!(!mem_dir
+            .join("archive")
+            .join("123-agent-planted.md")
+            .exists());
+        assert_eq!(
+            fs::read_to_string(mem_dir.join("lessons.md")).unwrap(),
+            "curated lessons"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn memory_promote_lane_wall_fail_closed_defaults() {
+        // Adversarial: a restricted-origin candidate claiming sfw
+        // WITHOUT evidence is unclassified — the fail-closed default
+        // reads it as nsfw, so the wall refuses it into a general
+        // repo. And a candidate whose label value is unparseable is
+        // refused as malformed by the birth gate (missing
+        // content_label), never defaulted through the wall.
+        let root = tmp_root("promote-wall-default");
+        let mem_dir = root.join(".ai").join("memory");
+        fs::create_dir_all(mem_dir.join("inbox")).unwrap();
+        fs::write(
+            mem_dir.join("inbox").join("123-agent-unclassified.md"),
+            "---\norigin_lane: restricted\ncontent_label: sfw\n---\n\nunreviewed lesson",
+        )
+        .unwrap();
+        let err = memory_promote(&root, "123-agent-unclassified.md", "lessons.md").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("lane_wall_refusal"), "{}", msg);
+        assert!(mem_dir
+            .join("inbox")
+            .join("123-agent-unclassified.md")
+            .exists());
+
+        fs::write(
+            mem_dir.join("inbox").join("124-agent-garbled.md"),
+            "---\norigin_lane: general\ncontent_label: banana\nevidence: unit test\n---\n\ngarbled lesson",
+        )
+        .unwrap();
+        let err = memory_promote(&root, "124-agent-garbled.md", "lessons.md").unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("unlabeled_candidate"), "{}", msg);
+        assert!(msg.contains("content_label"), "{}", msg);
+        assert!(mem_dir.join("inbox").join("124-agent-garbled.md").exists());
         let _ = fs::remove_dir_all(&root);
     }
 

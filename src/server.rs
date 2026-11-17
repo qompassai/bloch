@@ -741,7 +741,7 @@ pub fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "memory_promote",
-            "description": "Gated write. Promote an inbox entry to a curated memory file (decisions.md|patterns.md|current.md|lessons.md). Gate act: promoter must be pax or owner, never the proposer; cited evidence must resolve (repo-relative file or commit:<sha>). Birth-metadata gate (D-1030): a candidate whose frontmatter lacks origin_lane or content_label is refused (unlabeled_candidate). An nsfw->sfw reclassification is possible only here, with reclassify_evidence.",
+            "description": "Gated write. Promote an inbox entry to a curated memory file (decisions.md|patterns.md|current.md|lessons.md). Gate act: promoter must be pax or owner, never the proposer; cited evidence must resolve (repo-relative file or commit:<sha>). Birth-metadata gate (D-1030): a candidate whose frontmatter lacks origin_lane or content_label is refused (unlabeled_candidate). Lane wall (SPEC §9): a candidate whose effective label is nsfw is refused into a general-lane repo (lane_wall_refusal). An nsfw->sfw reclassification is possible only here, with reclassify_evidence.",
             "inputSchema": obj(serde_json::json!({
                 "repo": s("Repo name"),
                 "file": s("Inbox file name"),
@@ -2396,6 +2396,50 @@ mod tests {
             "{}",
             result_text(&resp)
         );
+        let _ = fs::remove_dir_all(&fx.base);
+    }
+
+    #[test]
+    fn promote_planted_nsfw_into_general_refused_by_lane_wall() {
+        let fx = fixture();
+        let mut srv = server(&fx);
+        // Adversarial: a hand-planted inbox file in general-lane
+        // repo_a — complete birth metadata, nsfw label, never passed
+        // through memory_propose. Every other promote gate is
+        // satisfied (owner promoting a worker's entry, cited evidence
+        // resolves); the lane wall inside memory_promote is the only
+        // check that can refuse this, and it must.
+        let inbox = fx.repo_a.join(".ai").join("memory").join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        fs::write(
+            inbox.join("1700000002-worker-planted.md"),
+            "---\norigin_lane: restricted\ncontent_label: nsfw\nevidence: owner review\n---\n\nadult scene lesson",
+        )
+        .unwrap();
+        let resp = call(
+            &mut srv,
+            "memory_promote",
+            serde_json::json!({
+                "repo": "repo_a", "file": "1700000002-worker-planted.md", "to": "lessons.md",
+                "promoter": "owner", "evidence": "evidence/gate-run.txt"
+            }),
+        );
+        assert!(is_error(&resp), "{}", result_text(&resp));
+        assert!(
+            result_text(&resp).contains("lane_wall_refusal"),
+            "{}",
+            result_text(&resp)
+        );
+        // Nothing moved: the planted file stays in the inbox and no
+        // archive copy appears.
+        assert!(inbox.join("1700000002-worker-planted.md").exists());
+        assert!(!fx
+            .repo_a
+            .join(".ai")
+            .join("memory")
+            .join("archive")
+            .join("1700000002-worker-planted.md")
+            .exists());
         let _ = fs::remove_dir_all(&fx.base);
     }
 

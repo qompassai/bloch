@@ -703,133 +703,133 @@ pub fn tool_definitions() -> serde_json::Value {
     serde_json::json!([
         {
             "name": "memory_search",
-            "description": "Read. Cross-repo search over indexed .ai/memory entries. Lane-filtered server-side: nsfw-labeled entries are never returned to general-only callers.",
+            "description": "Read. Cross-repo search over indexed .ai/memory entries, lane-filtered server-side (nsfw hidden from general-only callers).",
             "inputSchema": obj(serde_json::json!({
-                "query": s("Search text (all tokens must match)"),
-                "repo": s("Optional repo name filter"),
-                "state": s("Optional promotion state filter: inbox|promoted|archive"),
-                "caller": s("Caller name for policy clearance lookup"),
-                "clearance": s("Caller clearance lane: general (default) or restricted"),
+                "query": s("Search text (all tokens match)."),
+                "repo": s("Repo filter"),
+                "state": s("State filter: inbox|promoted|archive"),
+                "caller": s("Caller name."),
+                "clearance": s("general (default)|restricted"),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec!["query"]),
             "annotations": read
         },
         {
             "name": "memory_get",
-            "description": "Read. One indexed memory entry by id (<repo>:<rel path>), with label, promotion state, and text. Lane-filtered server-side.",
+            "description": "Read. One memory entry by id (<repo>:<rel path>): label, state, text. Lane-filtered.",
             "inputSchema": obj(serde_json::json!({
                 "id": s("Entry id from memory_search"),
-                "caller": s("Caller name for policy clearance lookup"),
-                "clearance": s("Caller clearance lane: general (default) or restricted")
+                "caller": s("Caller name."),
+                "clearance": s("general (default)|restricted")
             }), vec!["id"]),
             "annotations": read
         },
         {
             "name": "memory_propose",
-            "description": "Write, inbox only. File a memory entry into a repo's .ai/memory/inbox. Requires the repo's current fencing generation and a live attention lease (MATE-issued, policy-as-data) held by the agent. Cannot promote, cannot touch promoted entries or CHECKLIST.md. Nsfw-labeled content into a general-lane repo is refused (lane wall).",
+            "description": "Write, inbox only. File a memory entry into a repo's .ai/memory/inbox. Requires the repo's current fencing generation + a live MATE lease. Cannot promote, touch promoted entries, or CHECKLIST.md. Nsfw content into a general-lane repo refused (lane wall).",
             "inputSchema": obj(serde_json::json!({
-                "repo": s("Target repo name"),
-                "agent": s("Proposing agent (lease holder)"),
-                "topic": s("Topic slug for the inbox file name"),
+                "repo": s("Target repo"),
+                "agent": s("Proposer (lease holder)."),
+                "topic": s("Topic slug (inbox file)."),
                 "content": s("Entry content (markdown)"),
-                "generation": {"type": "integer", "minimum": 0, "description": "The repo's current fencing generation"},
-                "content_label": s("Optional claimed content label: sfw|nsfw (takes effect only with label_evidence)"),
-                "label_evidence": s("Evidence for the claimed content label"),
-                "source_repo": s("Optional source repo for a cross-repo transfer; its lane stamps the entry's origin_lane")
+                "generation": {"type": "integer", "minimum": 0, "description": "Repo's current fencing generation."},
+                "content_label": s("Claimed label: sfw|nsfw (needs label_evidence)."),
+                "label_evidence": s("Label evidence."),
+                "source_repo": s("Cross-repo source repo; its lane stamps origin_lane.")
             }), vec!["repo", "agent", "topic", "content", "generation"]),
             "annotations": write_inbox
         },
         {
             "name": "memory_promote",
-            "description": "Gated write. Promote an inbox entry to a curated memory file (decisions.md|patterns.md|current.md|lessons.md). Gate act: promoter must be pax or owner, never the proposer; cited evidence must resolve (repo-relative file or commit:<sha>). Birth-metadata gate (D-1030): a candidate whose frontmatter lacks origin_lane or content_label is refused (unlabeled_candidate). An nsfw->sfw reclassification is possible only here, with reclassify_evidence.",
+            "description": "Gated write. Promote an inbox entry to a curated file (decisions|patterns|current|lessons.md). Promoter: pax or owner, never the proposer; evidence must resolve. Birth-metadata gate (D-1030): missing origin_lane/content_label refused (unlabeled_candidate). nsfw->sfw reclassification only here, with reclassify_evidence.",
             "inputSchema": obj(serde_json::json!({
-                "repo": s("Repo name"),
-                "file": s("Inbox file name"),
+                "repo": s("Repo"),
+                "file": s("Inbox file."),
                 "to": s("Target curated file"),
-                "promoter": s("Promoting actor: pax or owner"),
-                "evidence": s("Evidence pointer: repo-relative path or commit:<sha>"),
-                "reclassify_to": s("Optional gated reclassification: sfw|nsfw"),
-                "reclassify_evidence": s("Evidence for the reclassification (required with reclassify_to)")
+                "promoter": s("Promoter: pax or owner."),
+                "evidence": s("Evidence: repo-relative path or commit:<sha>."),
+                "reclassify_to": s("Reclassify to: sfw|nsfw"),
+                "reclassify_evidence": s("Evidence (required with reclassify_to).")
             }), vec!["repo", "file", "to", "promoter", "evidence"]),
             "annotations": gated
         },
         {
             "name": "tracker_state",
-            "description": "Read. One repo's tracker rollup from CHECKLIST.md: per-section counts, fencing generation, overclaims (done items whose cited evidence is missing or unpromoted).",
-            "inputSchema": obj(serde_json::json!({"repo": s("Repo name")}), vec!["repo"]),
+            "description": "Read. Tracker rollup for one repo (CHECKLIST.md): section counts, fencing generation, overclaims (done items with missing/unpromoted cited evidence).",
+            "inputSchema": obj(serde_json::json!({"repo": s("Repo")}), vec!["repo"]),
             "annotations": read
         },
         {
             "name": "tracker_rollup",
-            "description": "Read. The fleet view of tracker_state for every registered repo, in progress-board order when a board file is configured.",
+            "description": "Read. tracker_state for every registered repo (progress-board order if configured).",
             "inputSchema": obj(serde_json::json!({}), vec![]),
             "annotations": read
         },
         {
             "name": "idea_lookup",
-            "description": "Read. Anti-duplication pre-flight: query the idea register by ID, statement text, or alias. Returns the one entry or an explicit no-match.",
+            "description": "Read. Anti-duplication pre-flight over the idea register (ID, statement, or alias). Returns the entry or an explicit no-match.",
             "inputSchema": obj(serde_json::json!({"query": s("IDEA id, statement fragment, or alias")}), vec!["query"]),
             "annotations": read
         },
         {
             "name": "idea_register",
-            "description": "Gated write. Register a new idea (server assigns the next sequential ID, never reused). Gate act: registrar must be pax or owner. A proposed alias colliding with an existing entry is refused as a suspected duplicate.",
+            "description": "Gated write. Register a new idea (server assigns the next sequential ID, never reused). Registrar: pax or owner. A colliding alias is refused as a suspected duplicate.",
             "inputSchema": obj(serde_json::json!({
                 "statement": s("One-line idea statement"),
-                "home": s("The idea's one home (repo/program)"),
+                "home": s("The idea's home."),
                 "aliases": {"type": "array", "items": {"type": "string"}},
-                "registrar": s("Registering actor: pax or owner")
+                "registrar": s("Registrar: pax or owner.")
             }), vec!["statement", "home", "registrar"]),
             "annotations": gated
         },
         {
             "name": "lessons_search",
-            "description": "Read. Cross-repo search over lessons.md, promoted attempt-fix entries, and attempt aggregates (confidence trajectories, mean time-to-green by repo kind): what another agent learned the hard way. Lane-filtered server-side.",
+            "description": "Read. Cross-repo lessons search: lessons.md, promoted attempt-fix entries, attempt aggregates (confidence trajectories, mean time-to-green). Lane-filtered.",
             "inputSchema": obj(serde_json::json!({
-                "query": s("Search text (all tokens must match)"),
-                "caller": s("Caller name for policy clearance lookup"),
-                "clearance": s("Caller clearance lane: general (default) or restricted"),
+                "query": s("Search text (all tokens match)."),
+                "caller": s("Caller name."),
+                "clearance": s("general (default)|restricted"),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec!["query"]),
             "annotations": read
         },
         {
             "name": "roadmap_state",
-            "description": "Read. One repo's roadmap rollup from .ai/roadmap.md: percent green per phase, next open task, live attempts with elapsed time (a live attempt is an attention claim), recent lessons.",
-            "inputSchema": obj(serde_json::json!({"repo": s("Repo name")}), vec!["repo"]),
+            "description": "Read. Roadmap rollup for one repo (.ai/roadmap.md): % green per phase, next open task, live attempts with elapsed time, recent lessons.",
+            "inputSchema": obj(serde_json::json!({"repo": s("Repo")}), vec!["repo"]),
             "annotations": read
         },
         {
             "name": "roadmap_rollup",
-            "description": "Read. The fleet view of roadmap_state: every bloch-initialised repo's v1 progress in one call.",
+            "description": "Read. roadmap_state for every bloch-initialised repo (v1 progress).",
             "inputSchema": obj(serde_json::json!({}), vec![]),
             "annotations": read
         },
         {
             "name": "outcome_record",
-            "description": "Write. Append one finished run's outcome record (INDEX 2.3) to the outcome store. Lane labels enforced at write: a record missing origin_lane, content_label, or evidence is refused (unlabelled_outcome); a record without a verification strength is refused (missing_verification); a record without a result is refused (missing_result). Nothing is defaulted at intake.",
+            "description": "Write. Append a finished run's outcome record (INDEX 2.3). Labels enforced at write: missing origin_lane/content_label/evidence refused (unlabelled_outcome); no verification (missing_verification); no result (missing_result). Nothing defaulted.",
             "inputSchema": obj(serde_json::json!({
-                "outcome_id": s("Unique outcome id (producer-assigned, never reused)"),
-                "server": s("Producing server, e.g. phlow"),
-                "asked": s("What was asked (summary, max 4000 chars)"),
-                "produced": {"type": "array", "description": "Artifacts produced, each with its sha256", "items": {"type": "object", "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "description": "64 lowercase hex chars"}}, "required": ["path", "sha256"], "additionalProperties": false}},
-                "result": s("What the run came to: ok|failed|abandoned"),
-                "verification": s("Verification strength: self_reported|tool_checked|independently_cross_checked|owner_judged"),
-                "cost": {"type": "object", "description": "Run cost; zero means not metered", "properties": {"wall_secs": {"type": "integer", "minimum": 0}, "tokens": {"type": "integer", "minimum": 0}, "disk_bytes": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
-                "skills": {"type": "array", "description": "Skill ids used by the run", "items": {"type": "string"}},
-                "origin_lane": s("Provenance lane from birth: general|restricted"),
-                "content_label": s("Content label from birth: sfw|nsfw"),
-                "evidence": s("Evidence for the content label (required, never empty)")
+                "outcome_id": s("Unique outcome id (never reused)."),
+                "server": s("Producing server."),
+                "asked": s("The ask (max 4000 chars)."),
+                "produced": {"type": "array", "description": "Artifacts produced (each with sha256).", "items": {"type": "object", "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "description": "64 lowercase hex chars"}}, "required": ["path", "sha256"], "additionalProperties": false}},
+                "result": s("Outcome: ok|failed|abandoned"),
+                "verification": s("Verification: self_reported|tool_checked|independently_cross_checked|owner_judged"),
+                "cost": {"type": "object", "description": "Run cost (0 = unmetered).", "properties": {"wall_secs": {"type": "integer", "minimum": 0}, "tokens": {"type": "integer", "minimum": 0}, "disk_bytes": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
+                "skills": {"type": "array", "description": "Skill ids.", "items": {"type": "string"}},
+                "origin_lane": s("Birth lane: general|restricted"),
+                "content_label": s("Birth label: sfw|nsfw"),
+                "evidence": s("Label evidence (required, never empty).")
             }), vec!["outcome_id", "server", "asked", "result", "verification", "origin_lane", "content_label", "evidence"]),
             "annotations": write_inbox
         },
         {
             "name": "outcome_list",
-            "description": "Read. Recent outcome records from the store, newest last. Lane-filtered server-side: nsfw-labeled records are never returned to general-only callers. count is the full visible total; outcomes is the bounded tail page.",
+            "description": "Read. Recent outcome records, newest last, lane-filtered (nsfw hidden from general-only callers). count = visible total; outcomes = bounded tail page.",
             "inputSchema": obj(serde_json::json!({
-                "server": s("Optional producing-server filter"),
-                "caller": s("Caller name for policy clearance lookup"),
-                "clearance": s("Caller clearance lane: general (default) or restricted"),
+                "server": s("Producing-server filter"),
+                "caller": s("Caller name."),
+                "clearance": s("general (default)|restricted"),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec![]),
             "annotations": read

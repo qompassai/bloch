@@ -700,6 +700,7 @@ pub fn tool_definitions() -> serde_json::Value {
         })
     };
     let s = |desc: &str| serde_json::json!({"type": "string", "description": desc});
+    let e = |desc: &str, values: Vec<&str>| serde_json::json!({"type": "string", "description": desc, "enum": values});
     serde_json::json!([
         {
             "name": "memory_search",
@@ -707,9 +708,9 @@ pub fn tool_definitions() -> serde_json::Value {
             "inputSchema": obj(serde_json::json!({
                 "query": s("Search text (all tokens match)."),
                 "repo": s("Repo filter"),
-                "state": s("State filter: inbox|promoted|archive"),
+                "state": e("State filter.", vec!["inbox", "promoted", "archive"]),
                 "caller": s("Caller name."),
-                "clearance": s("general (default)|restricted"),
+                "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"]),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec!["query"]),
             "annotations": read
@@ -720,7 +721,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "inputSchema": obj(serde_json::json!({
                 "id": s("Entry id from memory_search"),
                 "caller": s("Caller name."),
-                "clearance": s("general (default)|restricted")
+                "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"])
             }), vec!["id"]),
             "annotations": read
         },
@@ -733,7 +734,7 @@ pub fn tool_definitions() -> serde_json::Value {
                 "topic": s("Topic slug (inbox file)."),
                 "content": s("Entry content (markdown)"),
                 "generation": {"type": "integer", "minimum": 0, "description": "Repo's current fencing generation."},
-                "content_label": s("Claimed label: sfw|nsfw (needs label_evidence)."),
+                "content_label": e("Claimed label (needs label_evidence).", vec!["sfw", "nsfw"]),
                 "label_evidence": s("Label evidence."),
                 "source_repo": s("Cross-repo source repo; its lane stamps origin_lane.")
             }), vec!["repo", "agent", "topic", "content", "generation"]),
@@ -741,14 +742,14 @@ pub fn tool_definitions() -> serde_json::Value {
         },
         {
             "name": "memory_promote",
-            "description": "Gated write. Promote an inbox entry to a curated file (decisions|patterns|current|lessons.md). Promoter: pax or owner, never the proposer; evidence must resolve. Birth-metadata gate (D-1030): missing origin_lane/content_label refused (unlabeled_candidate). nsfw->sfw reclassification only here, with reclassify_evidence.",
+            "description": "Gated write. Promote an inbox entry to a curated file. Promoter: pax or owner, never the proposer; evidence must resolve. Birth-metadata gate (D-1030): missing origin_lane/content_label refused (unlabeled_candidate). nsfw->sfw reclassification only here, with reclassify_evidence.",
             "inputSchema": obj(serde_json::json!({
                 "repo": s("Repo"),
                 "file": s("Inbox file."),
-                "to": s("Target curated file"),
-                "promoter": s("Promoter: pax or owner."),
+                "to": e("Target curated file.", vec!["decisions.md", "patterns.md", "current.md", "lessons.md"]),
+                "promoter": e("Promoter.", vec!["pax", "owner"]),
                 "evidence": s("Evidence: repo-relative path or commit:<sha>."),
-                "reclassify_to": s("Reclassify to: sfw|nsfw"),
+                "reclassify_to": e("Reclassify to.", vec!["sfw", "nsfw"]),
                 "reclassify_evidence": s("Evidence (required with reclassify_to).")
             }), vec!["repo", "file", "to", "promoter", "evidence"]),
             "annotations": gated
@@ -778,7 +779,7 @@ pub fn tool_definitions() -> serde_json::Value {
                 "statement": s("One-line idea statement"),
                 "home": s("The idea's home."),
                 "aliases": {"type": "array", "items": {"type": "string"}},
-                "registrar": s("Registrar: pax or owner.")
+                "registrar": e("Registrar.", vec!["pax", "owner"])
             }), vec!["statement", "home", "registrar"]),
             "annotations": gated
         },
@@ -788,7 +789,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "inputSchema": obj(serde_json::json!({
                 "query": s("Search text (all tokens match)."),
                 "caller": s("Caller name."),
-                "clearance": s("general (default)|restricted"),
+                "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"]),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec!["query"]),
             "annotations": read
@@ -813,12 +814,12 @@ pub fn tool_definitions() -> serde_json::Value {
                 "server": s("Producing server."),
                 "asked": s("The ask (max 4000 chars)."),
                 "produced": {"type": "array", "description": "Artifacts produced (each with sha256).", "items": {"type": "object", "properties": {"path": {"type": "string"}, "sha256": {"type": "string", "description": "64 lowercase hex chars"}}, "required": ["path", "sha256"], "additionalProperties": false}},
-                "result": s("Outcome: ok|failed|abandoned"),
-                "verification": s("Verification: self_reported|tool_checked|independently_cross_checked|owner_judged"),
+                "result": e("Outcome.", vec!["ok", "failed", "abandoned"]),
+                "verification": e("Verification.", vec!["self_reported", "tool_checked", "independently_cross_checked", "owner_judged"]),
                 "cost": {"type": "object", "description": "Run cost (0 = unmetered).", "properties": {"wall_secs": {"type": "integer", "minimum": 0}, "tokens": {"type": "integer", "minimum": 0}, "disk_bytes": {"type": "integer", "minimum": 0}}, "additionalProperties": false},
                 "skills": {"type": "array", "description": "Skill ids.", "items": {"type": "string"}},
-                "origin_lane": s("Birth lane: general|restricted"),
-                "content_label": s("Birth label: sfw|nsfw"),
+                "origin_lane": e("Birth lane.", vec!["general", "restricted", "qompassai", "ntranch"]),
+                "content_label": e("Birth label.", vec!["sfw", "nsfw"]),
                 "evidence": s("Label evidence (required, never empty).")
             }), vec!["outcome_id", "server", "asked", "result", "verification", "origin_lane", "content_label", "evidence"]),
             "annotations": write_inbox
@@ -829,7 +830,7 @@ pub fn tool_definitions() -> serde_json::Value {
             "inputSchema": obj(serde_json::json!({
                 "server": s("Producing-server filter"),
                 "caller": s("Caller name."),
-                "clearance": s("general (default)|restricted"),
+                "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"]),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec![]),
             "annotations": read
@@ -1995,6 +1996,74 @@ mod tests {
             }
         }
         serde_json::to_string(&sort(value)).unwrap()
+    }
+
+    #[test]
+    fn tool_definition_enums_match_server_vocabularies() {
+        // Decision 17 formalization: every enum in the served schemas
+        // must name exactly the vocabulary the server's own parsers
+        // and gates accept — no more (fabricated values) and no less
+        // (an enum that narrows acceptance is a semantics change).
+        let tools = tool_definitions();
+        let get = |tool: &str, field: &str| {
+            let t = tools
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == tool)
+                .unwrap_or_else(|| panic!("tool {tool}"));
+            t["inputSchema"]["properties"][field]["enum"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{tool}.{field} carries no enum"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        // Validation: each enum value is accepted by its parser/gate.
+        for v in get("outcome_record", "result") {
+            assert!(crate::outcome::OutcomeResult::parse(&v).is_some(), "{v}");
+        }
+        for v in get("outcome_record", "verification") {
+            assert!(
+                crate::outcome::VerificationStrength::parse(&v).is_some(),
+                "{v}"
+            );
+        }
+        for v in get("outcome_record", "origin_lane") {
+            assert!(Lane::parse(&v).is_some(), "{v}");
+        }
+        for v in get("outcome_record", "content_label") {
+            assert!(ContentLabel::parse(&v).is_some(), "{v}");
+        }
+        for v in get("memory_propose", "content_label") {
+            assert!(ContentLabel::parse(&v).is_some(), "{v}");
+        }
+        for v in get("memory_promote", "reclassify_to") {
+            assert!(ContentLabel::parse(&v).is_some(), "{v}");
+        }
+        assert_eq!(
+            get("memory_promote", "to"),
+            vec!["decisions.md", "patterns.md", "current.md", "lessons.md"]
+        );
+        assert_eq!(get("memory_promote", "promoter"), vec!["pax", "owner"]);
+        assert_eq!(get("idea_register", "registrar"), vec!["pax", "owner"]);
+        assert_eq!(
+            get("memory_search", "state"),
+            vec!["inbox", "promoted", "archive"]
+        );
+        // Clearance: the enum covers every distinctly-behaving input
+        // class of clearance_for (general default, restricted/all and
+        // the ntranch legacy alias mapping to full clearance).
+        assert_eq!(
+            get("memory_search", "clearance"),
+            vec!["general", "restricted", "all", "ntranch"]
+        );
+        // Adversarial: values outside the enums refuse at the parsers,
+        // so the enums do not overstate acceptance either.
+        assert!(crate::outcome::OutcomeResult::parse("unknown").is_none());
+        assert!(crate::outcome::VerificationStrength::parse("guessed").is_none());
+        assert!(Lane::parse("public").is_none());
+        assert!(ContentLabel::parse("explicit").is_none());
     }
 
     #[test]

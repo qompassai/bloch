@@ -56,6 +56,8 @@ struct Args {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Print the identity and manifests embedded in this binary
+    Manifest,
     /// Agent persistent memory operations (read/write .ai/memory/ files)
     Memory {
         /// Root of the repository (defaults to current directory)
@@ -273,8 +275,33 @@ enum MemoryOp {
     },
 }
 
+fn embedded_manifest() -> serde_json::Result<serde_json::Value> {
+    let server_json: serde_json::Value =
+        serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/server.json")))?;
+    let agent_card: serde_json::Value =
+        serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/agent-card.json")))?;
+    Ok(serde_json::json!({
+        "name": env!("CARGO_BIN_NAME"),
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_hash": env!("BLOCH_EMBEDDED_GIT_HASH"),
+        "server_json": server_json,
+        "agent_card": agent_card,
+    }))
+}
+
 fn main() {
     let args = Args::parse();
+    if matches!(args.command, Some(Command::Manifest)) {
+        let manifest = embedded_manifest();
+        match manifest {
+            Ok(value) => println!("{value}"),
+            Err(err) => {
+                eprintln!("bloch: invalid embedded manifest: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let detect_root = args.root.clone().unwrap_or(PathBuf::from("."));
     let active_skills: Vec<String> = if args.no_skill_boost {
@@ -1040,4 +1067,23 @@ fn main() {
         emitted.len(),
         out.len()
     );
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::embedded_manifest;
+
+    #[test]
+    fn embedded_documents_match_package_version_and_binary_name() {
+        let manifest = embedded_manifest().expect("parse embedded JSON documents");
+        assert_eq!(
+            manifest["server_json"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        // Agent cards use a display name. crates.io uses the package name blochs.
+        assert!(manifest["agent_card"]["name"]
+            .as_str()
+            .expect("agent card display name")
+            .eq_ignore_ascii_case(env!("CARGO_CRATE_NAME")));
+    }
 }

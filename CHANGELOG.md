@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `bloch <root> manifest` prints the binary identity, build commit, embedded
+  Registry manifest, and agent card as JSON.
+
 ## [1.0.0] - 2026-11-15
 
 ### Added

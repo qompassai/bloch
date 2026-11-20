@@ -2,7 +2,6 @@
 name = "blochs-derive"
 version = "0.1.0"
 edition = "2021"
-publish = false
 description = "Compile-time MCP tool declarations and refusal codes"
 license = "Apache-2.0"
 

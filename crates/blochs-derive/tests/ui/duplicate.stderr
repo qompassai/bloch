@@ -1,0 +1,5 @@
+error: duplicate tool name
+ --> tests/ui/duplicate.rs:9:19
+  |
+9 |     #[tool(name = "same", schema = serde_json::json!({}))]
+  |                   ^^^^^^

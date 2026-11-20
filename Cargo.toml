@@ -21,8 +21,11 @@ path = "src/lib.rs"
 name = "bloch"
 path = "src/main.rs"
 
+[workspace]
+members = ["crates/blochs-derive"]
+
 [dependencies]
-mcp-derive = { path = "/home/phaedrus/.GH/Qompass/mcp-derive" }
+mcp-derive = { package = "blochs-derive", version = "0.1.0", path = "crates/blochs-derive" }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-lua = "0.2"

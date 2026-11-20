@@ -1,0 +1,5 @@
+error: missing refusal code
+ --> tests/ui/no_code.rs:5:5
+  |
+5 |     Missing(String),
+  |     ^^^^^^^^^^^^^^^

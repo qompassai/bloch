@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":2,"result":{"resultType":"complete","content":[{"type":"text","text":"promote_failed: Git operation failed: lane_wall_refusal: nsfw-labeled content may not be promoted into a general-lane repo"}],"isError":true}}

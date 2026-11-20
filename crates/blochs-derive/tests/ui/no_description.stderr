@@ -1,0 +1,6 @@
+error: missing tool description doc comment
+ --> tests/ui/no_description.rs:5:5
+  |
+5 | /     #[tool(name = "missing", schema = serde_json::json!({}))]
+6 | |     Missing,
+  | |___________^

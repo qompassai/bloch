@@ -2889,6 +2889,71 @@ pub fn memory_inbox(root: &Path, agent: &str, topic: &str, content: &str) -> Res
     Ok(fname)
 }
 
+/// Typed refusal codes used by the MCP boundary and the promotion gates.
+#[derive(mcp_derive::Refusal)]
+pub(crate) enum McpRefusal {
+    #[refusal(code = "entry_not_found")]
+    EntryNotFound(String),
+    #[refusal(code = "evidence_unresolved")]
+    EvidenceUnresolved(String),
+    #[refusal(code = "ideas_not_configured")]
+    IdeasNotConfigured(String),
+    #[refusal(code = "invalid_outcome")]
+    InvalidOutcome(String),
+    #[refusal(code = "invalid_params")]
+    InvalidParams(String),
+    #[refusal(code = "lane_forbidden")]
+    LaneForbidden(String),
+    #[refusal(code = "lane_wall_refusal")]
+    LaneWallRefusal(String),
+    #[refusal(code = "lease_expired")]
+    LeaseExpired(String),
+    #[refusal(code = "lease_required")]
+    LeaseRequired(String),
+    #[refusal(code = "outcomes_not_configured")]
+    OutcomesNotConfigured(String),
+    #[refusal(code = "payload_too_large")]
+    PayloadTooLarge(String),
+    #[refusal(code = "private_memory_refused")]
+    PrivateMemoryRefused(String),
+    #[refusal(code = "promote_failed")]
+    PromoteFailed(String),
+    #[refusal(code = "promoter_not_gatekeeper")]
+    PromoterNotGatekeeper(String),
+    #[refusal(code = "proposer_is_promoter")]
+    ProposerIsPromoter(String),
+    #[refusal(code = "query_too_long")]
+    QueryTooLong(String),
+    #[refusal(code = "reclassification_requires_evidence")]
+    ReclassificationRequiresEvidence(String),
+    #[refusal(code = "registrar_not_gatekeeper")]
+    RegistrarNotGatekeeper(String),
+    #[refusal(code = "repo_not_found")]
+    RepoNotFound(String),
+    #[refusal(code = "roadmap_not_found")]
+    RoadmapNotFound(String),
+    #[refusal(code = "stale_generation")]
+    StaleGeneration(String),
+    #[refusal(code = "suspected_duplicate")]
+    SuspectedDuplicate(String),
+    #[refusal(code = "unknown_tool")]
+    UnknownTool(String),
+    #[refusal(code = "unlabeled_candidate")]
+    UnlabeledCandidate(String),
+    #[refusal(code = "write_failed")]
+    WriteFailed(String),
+    #[refusal(code = "corrupt_outcome_store")]
+    CorruptOutcomeStore(String),
+    #[refusal(code = "missing_result")]
+    MissingResult(String),
+    #[refusal(code = "missing_verification")]
+    MissingVerification(String),
+    #[refusal(code = "read_failed")]
+    ReadFailed(String),
+    #[refusal(code = "unlabelled_outcome")]
+    UnlabelledOutcome(String),
+}
+
 /// Promote an inbox entry to a curated memory file.
 /// Appends inbox/<file> content to .ai/memory/<target>, then moves the
 /// inbox file to .ai/memory/archive/.
@@ -2926,11 +2991,14 @@ pub fn memory_promote(root: &Path, file: &str, target: &str) -> Result<String> {
     // move. Refusal leaves the inbox entry and the target untouched.
     let missing = missing_birth_labels(&content);
     if !missing.is_empty() {
-        return Err(BlochError::GitFailed(format!(
-            "unlabeled_candidate: promotion of '{}' refused — missing birth metadata: {}. Label the candidate via memory_propose before promotion.",
+        let message = format!(
+            "promotion of '{}' refused — missing birth metadata: {}. Label the candidate via memory_propose before promotion.",
             file,
             missing.join(", ")
-        )));
+        );
+        return Err(BlochError::GitFailed(
+            McpRefusal::UnlabeledCandidate(message).into(),
+        ));
     }
 
     // Lane wall (SPEC §9): the birth gate proves the candidate carries
@@ -2947,10 +3015,11 @@ pub fn memory_promote(root: &Path, file: &str, target: &str) -> Result<String> {
     let target_lane = repo_lane(root);
     let stamp = parse_label_frontmatter(&content, target_lane);
     if target_lane == Lane::General && stamp.content_label == ContentLabel::Nsfw {
-        return Err(BlochError::GitFailed(
-            "lane_wall_refusal: nsfw-labeled content may not be promoted into a general-lane repo"
-                .to_string(),
-        ));
+        return Err(BlochError::GitFailed(String::from(
+            McpRefusal::LaneWallRefusal(
+                "nsfw-labeled content may not be promoted into a general-lane repo".to_string(),
+            ),
+        )));
     }
 
     let dest = mem_dir.join(target);

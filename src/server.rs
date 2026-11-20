@@ -37,7 +37,7 @@ use crate::roadmap::{
     read_attempts, repo_lane, roadmap_status, ContentLabel, LabelStamp, Lane, LiveAttempt,
     TaskStatus,
 };
-use crate::{memory_inbox, memory_promote, run_git, BlochError, Result};
+use crate::{memory_inbox, memory_promote, run_git, BlochError, McpRefusal, Result};
 
 /// Maximum bytes accepted for one JSON-RPC line. The bound itself
 /// is owned by the era guard since v0.4; this name is kept as the
@@ -174,10 +174,12 @@ pub fn guard_root(root: &Path) -> Result<PathBuf> {
         let home = PathBuf::from(home_raw);
         let home_canonical = home.canonicalize().unwrap_or(home);
         if canonical == home_canonical || canonical.starts_with(home_canonical.join("memory")) {
-            return Err(BlochError::GitFailed(
-                "private_memory_refused: Pax's private memory (~/MEMORY.md, ~/memory/) is never indexed or served"
-                    .to_string(),
-            ));
+            return Err(BlochError::GitFailed(String::from(
+                McpRefusal::PrivateMemoryRefused(
+                    "Pax's private memory (~/MEMORY.md, ~/memory/) is never indexed or served"
+                        .to_string(),
+                ),
+            )));
         }
     }
     Ok(canonical)
@@ -677,35 +679,45 @@ fn snippet(text: &str, tokens: &[String]) -> String {
 // Tool surface (13 tools, annotations from birth)
 // ---------------------------------------------------------------------------
 
-/// The 13 tool definitions with full schemas and MCP annotations.
-/// Read tools are `readOnlyHint: true`; the two gated writes and the
-/// inbox write declare their own access class in their descriptions.
-pub fn tool_definitions() -> serde_json::Value {
-    let read = serde_json::json!({
-        "readOnlyHint": true, "destructiveHint": false,
-        "idempotentHint": true, "openWorldHint": false
-    });
-    let write_inbox = serde_json::json!({
-        "readOnlyHint": false, "destructiveHint": false,
-        "idempotentHint": false, "openWorldHint": false
-    });
-    let gated = serde_json::json!({
-        "readOnlyHint": false, "destructiveHint": false,
-        "idempotentHint": false, "openWorldHint": false
-    });
-    let obj = |props: serde_json::Value, required: Vec<&str>| {
-        serde_json::json!({
+mod tools {
+    use serde_json::{json, Value};
+
+    fn read() -> Value {
+        json!({
+            "readOnlyHint": true, "destructiveHint": false,
+            "idempotentHint": true, "openWorldHint": false
+        })
+    }
+
+    fn write() -> Value {
+        json!({
+            "readOnlyHint": false, "destructiveHint": false,
+            "idempotentHint": false, "openWorldHint": false
+        })
+    }
+
+    fn obj(props: Value, required: Vec<&str>) -> Value {
+        json!({
             "type": "object", "properties": props, "required": required,
             "additionalProperties": false
         })
-    };
-    let s = |desc: &str| serde_json::json!({"type": "string", "description": desc});
-    let e = |desc: &str, values: Vec<&str>| serde_json::json!({"type": "string", "description": desc, "enum": values});
-    serde_json::json!([
-        {
-            "name": "memory_search",
-            "description": "Read. Cross-repo search over indexed .ai/memory entries, lane-filtered server-side (nsfw hidden from general-only callers).",
-            "inputSchema": obj(serde_json::json!({
+    }
+
+    fn s(desc: &str) -> Value {
+        json!({"type": "string", "description": desc})
+    }
+
+    fn e(desc: &str, values: Vec<&str>) -> Value {
+        json!({"type": "string", "description": desc, "enum": values})
+    }
+
+    #[allow(dead_code)]
+    #[derive(mcp_derive::ToolDefinitions)]
+    pub(super) enum Tool {
+        /// Read. Cross-repo search over indexed .ai/memory entries, lane-filtered server-side (nsfw hidden from general-only callers).
+        #[tool(
+        name = "memory_search",
+        schema = obj(json!({
                 "query": s("Search text (all tokens match)."),
                 "repo": s("Repo filter"),
                 "state": e("State filter.", vec!["inbox", "promoted", "archive"]),
@@ -713,22 +725,24 @@ pub fn tool_definitions() -> serde_json::Value {
                 "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"]),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec!["query"]),
-            "annotations": read
-        },
-        {
-            "name": "memory_get",
-            "description": "Read. One memory entry by id (<repo>:<rel path>): label, state, text. Lane-filtered.",
-            "inputSchema": obj(serde_json::json!({
+        annotations = read()
+    )]
+        MemorySearch,
+        /// Read. One memory entry by id (<repo>:<rel path>): label, state, text. Lane-filtered.
+        #[tool(
+        name = "memory_get",
+        schema = obj(json!({
                 "id": s("Entry id from memory_search"),
                 "caller": s("Caller name."),
                 "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"])
             }), vec!["id"]),
-            "annotations": read
-        },
-        {
-            "name": "memory_propose",
-            "description": "Write, inbox only. File a memory entry into a repo's .ai/memory/inbox. Requires the repo's current fencing generation + a live MATE lease. Cannot promote, touch promoted entries, or CHECKLIST.md. Nsfw content into a general-lane repo refused (lane wall).",
-            "inputSchema": obj(serde_json::json!({
+        annotations = read()
+    )]
+        MemoryGet,
+        /// Write, inbox only. File a memory entry into a repo's .ai/memory/inbox. Requires the repo's current fencing generation + a live MATE lease. Cannot promote, touch promoted entries, or CHECKLIST.md. Nsfw content into a general-lane repo refused (lane wall).
+        #[tool(
+        name = "memory_propose",
+        schema = obj(json!({
                 "repo": s("Target repo"),
                 "agent": s("Proposer (lease holder)."),
                 "topic": s("Topic slug (inbox file)."),
@@ -738,12 +752,13 @@ pub fn tool_definitions() -> serde_json::Value {
                 "label_evidence": s("Label evidence."),
                 "source_repo": s("Cross-repo source repo; its lane stamps origin_lane.")
             }), vec!["repo", "agent", "topic", "content", "generation"]),
-            "annotations": write_inbox
-        },
-        {
-            "name": "memory_promote",
-            "description": "Gated write. Promote an inbox entry to a curated file. Promoter: pax or owner, never the proposer; evidence must resolve. Birth-metadata gate (D-1030): missing origin_lane/content_label refused (unlabeled_candidate). Lane wall (SPEC §9): effective-nsfw candidate refused into a general-lane repo (lane_wall_refusal). nsfw->sfw reclassification only here, with reclassify_evidence.",
-            "inputSchema": obj(serde_json::json!({
+        annotations = write()
+    )]
+        MemoryPropose,
+        /// Gated write. Promote an inbox entry to a curated file. Promoter: pax or owner, never the proposer; evidence must resolve. Birth-metadata gate (D-1030): missing origin_lane/content_label refused (unlabeled_candidate). Lane wall (SPEC §9): effective-nsfw candidate refused into a general-lane repo (lane_wall_refusal). nsfw->sfw reclassification only here, with reclassify_evidence.
+        #[tool(
+        name = "memory_promote",
+        schema = obj(json!({
                 "repo": s("Repo"),
                 "file": s("Inbox file."),
                 "to": e("Target curated file.", vec!["decisions.md", "patterns.md", "current.md", "lessons.md"]),
@@ -752,64 +767,72 @@ pub fn tool_definitions() -> serde_json::Value {
                 "reclassify_to": e("Reclassify to.", vec!["sfw", "nsfw"]),
                 "reclassify_evidence": s("Evidence (required with reclassify_to).")
             }), vec!["repo", "file", "to", "promoter", "evidence"]),
-            "annotations": gated
-        },
-        {
-            "name": "tracker_state",
-            "description": "Read. Tracker rollup for one repo (CHECKLIST.md): section counts, fencing generation, overclaims (done items with missing/unpromoted cited evidence).",
-            "inputSchema": obj(serde_json::json!({"repo": s("Repo")}), vec!["repo"]),
-            "annotations": read
-        },
-        {
-            "name": "tracker_rollup",
-            "description": "Read. tracker_state for every registered repo (progress-board order if configured).",
-            "inputSchema": obj(serde_json::json!({}), vec![]),
-            "annotations": read
-        },
-        {
-            "name": "idea_lookup",
-            "description": "Read. Anti-duplication pre-flight over the idea register (ID, statement, or alias). Returns the entry or an explicit no-match.",
-            "inputSchema": obj(serde_json::json!({"query": s("IDEA id, statement fragment, or alias")}), vec!["query"]),
-            "annotations": read
-        },
-        {
-            "name": "idea_register",
-            "description": "Gated write. Register a new idea (server assigns the next sequential ID, never reused). Registrar: pax or owner. A colliding alias is refused as a suspected duplicate.",
-            "inputSchema": obj(serde_json::json!({
+        annotations = write()
+    )]
+        MemoryPromote,
+        /// Read. Tracker rollup for one repo (CHECKLIST.md): section counts, fencing generation, overclaims (done items with missing/unpromoted cited evidence).
+        #[tool(
+        name = "tracker_state",
+        schema = obj(json!({"repo": s("Repo")}), vec!["repo"]),
+        annotations = read()
+    )]
+        TrackerState,
+        /// Read. tracker_state for every registered repo (progress-board order if configured).
+        #[tool(
+        name = "tracker_rollup",
+        schema = obj(json!({}), vec![]),
+        annotations = read()
+    )]
+        TrackerRollup,
+        /// Read. Anti-duplication pre-flight over the idea register (ID, statement, or alias). Returns the entry or an explicit no-match.
+        #[tool(
+        name = "idea_lookup",
+        schema = obj(json!({"query": s("IDEA id, statement fragment, or alias")}), vec!["query"]),
+        annotations = read()
+    )]
+        IdeaLookup,
+        /// Gated write. Register a new idea (server assigns the next sequential ID, never reused). Registrar: pax or owner. A colliding alias is refused as a suspected duplicate.
+        #[tool(
+        name = "idea_register",
+        schema = obj(json!({
                 "statement": s("One-line idea statement"),
                 "home": s("The idea's home."),
                 "aliases": {"type": "array", "items": {"type": "string"}},
                 "registrar": e("Registrar.", vec!["pax", "owner"])
             }), vec!["statement", "home", "registrar"]),
-            "annotations": gated
-        },
-        {
-            "name": "lessons_search",
-            "description": "Read. Cross-repo lessons search: lessons.md, promoted attempt-fix entries, attempt aggregates (confidence trajectories, mean time-to-green). Lane-filtered.",
-            "inputSchema": obj(serde_json::json!({
+        annotations = write()
+    )]
+        IdeaRegister,
+        /// Read. Cross-repo lessons search: lessons.md, promoted attempt-fix entries, attempt aggregates (confidence trajectories, mean time-to-green). Lane-filtered.
+        #[tool(
+        name = "lessons_search",
+        schema = obj(json!({
                 "query": s("Search text (all tokens match)."),
                 "caller": s("Caller name."),
                 "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"]),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec!["query"]),
-            "annotations": read
-        },
-        {
-            "name": "roadmap_state",
-            "description": "Read. Roadmap rollup for one repo (.ai/roadmap.md): % green per phase, next open task, live attempts with elapsed time, recent lessons.",
-            "inputSchema": obj(serde_json::json!({"repo": s("Repo")}), vec!["repo"]),
-            "annotations": read
-        },
-        {
-            "name": "roadmap_rollup",
-            "description": "Read. roadmap_state for every bloch-initialised repo (v1 progress).",
-            "inputSchema": obj(serde_json::json!({}), vec![]),
-            "annotations": read
-        },
-        {
-            "name": "outcome_record",
-            "description": "Write. Append a finished run's outcome record (INDEX 2.3). Labels enforced at write: missing origin_lane/content_label/evidence refused (unlabelled_outcome); no verification (missing_verification); no result (missing_result). Nothing defaulted.",
-            "inputSchema": obj(serde_json::json!({
+        annotations = read()
+    )]
+        LessonsSearch,
+        /// Read. Roadmap rollup for one repo (.ai/roadmap.md): % green per phase, next open task, live attempts with elapsed time, recent lessons.
+        #[tool(
+        name = "roadmap_state",
+        schema = obj(json!({"repo": s("Repo")}), vec!["repo"]),
+        annotations = read()
+    )]
+        RoadmapState,
+        /// Read. roadmap_state for every bloch-initialised repo (v1 progress).
+        #[tool(
+        name = "roadmap_rollup",
+        schema = obj(json!({}), vec![]),
+        annotations = read()
+    )]
+        RoadmapRollup,
+        /// Write. Append a finished run's outcome record (INDEX 2.3). Labels enforced at write: missing origin_lane/content_label/evidence refused (unlabelled_outcome); no verification (missing_verification); no result (missing_result). Nothing defaulted.
+        #[tool(
+        name = "outcome_record",
+        schema = obj(json!({
                 "outcome_id": s("Unique outcome id (never reused)."),
                 "server": s("Producing server."),
                 "asked": s("The ask (max 4000 chars)."),
@@ -822,20 +845,27 @@ pub fn tool_definitions() -> serde_json::Value {
                 "content_label": e("Birth label.", vec!["sfw", "nsfw"]),
                 "evidence": s("Label evidence (required, never empty).")
             }), vec!["outcome_id", "server", "asked", "result", "verification", "origin_lane", "content_label", "evidence"]),
-            "annotations": write_inbox
-        },
-        {
-            "name": "outcome_list",
-            "description": "Read. Recent outcome records, newest last, lane-filtered (nsfw hidden from general-only callers). count = visible total; outcomes = bounded tail page.",
-            "inputSchema": obj(serde_json::json!({
+        annotations = write()
+    )]
+        OutcomeRecord,
+        /// Read. Recent outcome records, newest last, lane-filtered (nsfw hidden from general-only callers). count = visible total; outcomes = bounded tail page.
+        #[tool(
+        name = "outcome_list",
+        schema = obj(json!({
                 "server": s("Producing-server filter"),
                 "caller": s("Caller name."),
                 "clearance": e("Caller clearance (default general).", vec!["general", "restricted", "all", "ntranch"]),
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50}
             }), vec![]),
-            "annotations": read
-        }
-    ])
+        annotations = read()
+    )]
+        OutcomeList,
+    }
+}
+
+/// The 13 tool definitions with full schemas and MCP annotations.
+pub fn tool_definitions() -> serde_json::Value {
+    tools::Tool::definitions()
 }
 
 // ---------------------------------------------------------------------------
@@ -918,11 +948,14 @@ impl McpServer {
     }
 
     fn repo_required(&self, args: &serde_json::Value) -> std::result::Result<&FleetRepo, String> {
-        let name = arg_str(args, "repo")
-            .ok_or_else(|| "invalid_params: missing required argument 'repo'".to_string())?;
+        let name = arg_str(args, "repo").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'repo'".to_string(),
+            ))
+        })?;
         self.index
             .repo(&name)
-            .ok_or_else(|| format!("repo_not_found: {}", name))
+            .ok_or_else(|| String::from(McpRefusal::RepoNotFound(name)))
     }
 
     /// Dispatch one tool call. Errors are typed strings
@@ -942,19 +975,22 @@ impl McpServer {
             "roadmap_rollup" => self.tool_roadmap_rollup(args),
             "outcome_record" => self.tool_outcome_record(args),
             "outcome_list" => self.tool_outcome_list(args),
-            _ => Err(format!("unknown_tool: {}", name)),
+            _ => Err(String::from(McpRefusal::UnknownTool(name.to_string()))),
         }
     }
 
     fn tool_memory_search(&mut self, args: &serde_json::Value) -> ToolResult {
-        let query = arg_str(args, "query")
-            .ok_or_else(|| "invalid_params: missing required argument 'query'".to_string())?;
+        let query = arg_str(args, "query").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'query'".to_string(),
+            ))
+        })?;
         if query.chars().count() > SEARCH_QUERY_MAX {
-            return Err(format!(
-                "query_too_long: {} chars exceeds limit {}",
+            return Err(String::from(McpRefusal::QueryTooLong(format!(
+                "{} chars exceeds limit {}",
                 query.chars().count(),
                 SEARCH_QUERY_MAX
-            ));
+            ))));
         }
         let clearance = self.clearance_for(args);
         let tokens = query_tokens(&query);
@@ -1000,20 +1036,23 @@ impl McpServer {
     }
 
     fn tool_memory_get(&mut self, args: &serde_json::Value) -> ToolResult {
-        let id = arg_str(args, "id")
-            .ok_or_else(|| "invalid_params: missing required argument 'id'".to_string())?;
+        let id = arg_str(args, "id").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'id'".to_string(),
+            ))
+        })?;
         let clearance = self.clearance_for(args);
         let entry = self
             .index
             .entries
             .iter()
             .find(|e| e.id == id)
-            .ok_or_else(|| format!("entry_not_found: {}", id))?;
+            .ok_or_else(|| String::from(McpRefusal::EntryNotFound(id.clone())))?;
         if !clearance.can_see(entry.label.content_label) {
-            return Err(format!(
-                "lane_forbidden: entry {} is nsfw-labeled; caller clearance is general-only",
+            return Err(String::from(McpRefusal::LaneForbidden(format!(
+                "entry {} is nsfw-labeled; caller clearance is general-only",
                 id
-            ));
+            ))));
         }
         Ok(serde_json::json!({
             "content_label": entry.label.content_label.as_str(),
@@ -1032,31 +1071,46 @@ impl McpServer {
 
     fn tool_memory_propose(&mut self, args: &serde_json::Value) -> ToolResult {
         let repo = self.repo_required(args)?.clone();
-        let agent = arg_str(args, "agent")
-            .ok_or_else(|| "invalid_params: missing required argument 'agent'".to_string())?;
-        let topic = arg_str(args, "topic")
-            .ok_or_else(|| "invalid_params: missing required argument 'topic'".to_string())?;
-        let content = arg_str(args, "content")
-            .ok_or_else(|| "invalid_params: missing required argument 'content'".to_string())?;
+        let agent = arg_str(args, "agent").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'agent'".to_string(),
+            ))
+        })?;
+        let topic = arg_str(args, "topic").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'topic'".to_string(),
+            ))
+        })?;
+        let content = arg_str(args, "content").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'content'".to_string(),
+            ))
+        })?;
         if content.trim().is_empty() {
-            return Err("invalid_params: content must not be empty".to_string());
+            return Err(String::from(McpRefusal::InvalidParams(
+                "content must not be empty".to_string(),
+            )));
         }
         if content.chars().count() > PROPOSE_CONTENT_MAX {
-            return Err(format!(
-                "payload_too_large: content {} chars exceeds limit {}",
+            return Err(String::from(McpRefusal::PayloadTooLarge(format!(
+                "content {} chars exceeds limit {}",
                 content.chars().count(),
                 PROPOSE_CONTENT_MAX
-            ));
+            ))));
         }
         let generation = args
             .get("generation")
             .and_then(|v| v.as_u64())
-            .ok_or_else(|| "invalid_params: missing required argument 'generation'".to_string())?;
+            .ok_or_else(|| {
+                String::from(McpRefusal::InvalidParams(
+                    "missing required argument 'generation'".to_string(),
+                ))
+            })?;
         if generation != repo.generation {
-            return Err(format!(
-                "stale_generation: presented {}, current {} for repo {}",
+            return Err(String::from(McpRefusal::StaleGeneration(format!(
+                "presented {}, current {} for repo {}",
                 generation, repo.generation, repo.name
-            ));
+            ))));
         }
         let now = now_epoch();
         let lease = self
@@ -1066,22 +1120,22 @@ impl McpServer {
             .find(|l| l.repo == repo.name && l.holder == agent);
         match lease {
             None => {
-                return Err(format!(
-                    "lease_required: no attention lease for {} on repo {}",
+                return Err(String::from(McpRefusal::LeaseRequired(format!(
+                    "no attention lease for {} on repo {}",
                     agent, repo.name
-                ))
+                ))))
             }
             Some(l) if l.expires_epoch <= now => {
-                return Err(format!(
-                    "lease_expired: lease for {} on repo {} expired at {}",
+                return Err(String::from(McpRefusal::LeaseExpired(format!(
+                    "lease for {} on repo {} expired at {}",
                     agent, repo.name, l.expires_epoch
-                ))
+                ))))
             }
             Some(l) if l.generation != generation => {
-                return Err(format!(
-                    "stale_generation: lease was awarded at generation {}, presented {}",
+                return Err(String::from(McpRefusal::StaleGeneration(format!(
+                    "lease was awarded at generation {}, presented {}",
                     l.generation, generation
-                ))
+                ))))
             }
             _ => {}
         }
@@ -1097,15 +1151,14 @@ impl McpServer {
                 .index
                 .repo(&src)
                 .map(|r| r.lane)
-                .ok_or_else(|| format!("repo_not_found: {}", src))?,
+                .ok_or_else(|| String::from(McpRefusal::RepoNotFound(src)))?,
             None => repo.lane,
         };
         let stamp = decide_content_label(origin_lane, claimed, &label_evidence);
         if repo.lane == Lane::General && stamp.content_label == ContentLabel::Nsfw {
-            return Err(
-                "lane_wall_refusal: nsfw-labeled content may not be proposed into a general-lane repo"
-                    .to_string(),
-            );
+            return Err(String::from(McpRefusal::LaneWallRefusal(
+                "nsfw-labeled content may not be proposed into a general-lane repo".to_string(),
+            )));
         }
         let labelled = format!(
             "{}{}<!-- bloch:proposer {} -->\n{}",
@@ -1115,7 +1168,7 @@ impl McpServer {
             content
         );
         let fname = memory_inbox(&repo.root, &agent, &topic, &labelled)
-            .map_err(|e| format!("write_failed: {}", e))?;
+            .map_err(|e| String::from(McpRefusal::WriteFailed(e.to_string())))?;
         let result = serde_json::json!({
             "content_label": stamp.content_label.as_str(),
             "file": fname,
@@ -1129,18 +1182,27 @@ impl McpServer {
 
     fn tool_memory_promote(&mut self, args: &serde_json::Value) -> ToolResult {
         let repo = self.repo_required(args)?.clone();
-        let file = arg_str(args, "file")
-            .ok_or_else(|| "invalid_params: missing required argument 'file'".to_string())?;
-        let to = arg_str(args, "to")
-            .ok_or_else(|| "invalid_params: missing required argument 'to'".to_string())?;
-        let promoter = arg_str(args, "promoter")
-            .ok_or_else(|| "invalid_params: missing required argument 'promoter'".to_string())?;
+        let file = arg_str(args, "file").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'file'".to_string(),
+            ))
+        })?;
+        let to = arg_str(args, "to").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'to'".to_string(),
+            ))
+        })?;
+        let promoter = arg_str(args, "promoter").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'promoter'".to_string(),
+            ))
+        })?;
         let evidence = arg_str(args, "evidence").unwrap_or_default();
         if !matches!(promoter.to_ascii_lowercase().as_str(), "pax" | "owner") {
-            return Err(format!(
-                "promoter_not_gatekeeper: promotion is a Pax/Owner gate act, got '{}'",
+            return Err(String::from(McpRefusal::PromoterNotGatekeeper(format!(
+                "promotion is a Pax/Owner gate act, got '{}'",
                 promoter
-            ));
+            ))));
         }
         let inbox_path = repo
             .root
@@ -1149,7 +1211,7 @@ impl McpServer {
             .join("inbox")
             .join(&file);
         let content = std::fs::read_to_string(&inbox_path)
-            .map_err(|_| format!("entry_not_found: inbox file {}", file))?;
+            .map_err(|_| String::from(McpRefusal::EntryNotFound(format!("inbox file {}", file))))?;
         let proposer = content
             .lines()
             .find_map(|l| {
@@ -1161,26 +1223,28 @@ impl McpServer {
             .or_else(|| file.split('-').nth(1).map(|s| s.to_string()))
             .unwrap_or_default();
         if !proposer.is_empty() && proposer.eq_ignore_ascii_case(&promoter) {
-            return Err(
-                "proposer_is_promoter: the proposing agent may never promote its own entry"
-                    .to_string(),
-            );
+            return Err(String::from(McpRefusal::ProposerIsPromoter(
+                "the proposing agent may never promote its own entry".to_string(),
+            )));
         }
         if evidence.trim().is_empty() || !evidence_resolves(&repo.root, &evidence) {
-            return Err(format!(
-                "evidence_unresolved: cited evidence '{}' does not resolve",
+            return Err(String::from(McpRefusal::EvidenceUnresolved(format!(
+                "cited evidence '{}' does not resolve",
                 evidence
-            ));
+            ))));
         }
         if let Some(target) = arg_str(args, "reclassify_to") {
-            let target_label = ContentLabel::parse(&target)
-                .ok_or_else(|| format!("invalid_params: bad reclassify_to '{}'", target))?;
+            let target_label = ContentLabel::parse(&target).ok_or_else(|| {
+                String::from(McpRefusal::InvalidParams(format!(
+                    "bad reclassify_to '{}'",
+                    target
+                )))
+            })?;
             let re_evidence = arg_str(args, "reclassify_evidence").unwrap_or_default();
             if re_evidence.trim().is_empty() {
-                return Err(
-                    "reclassification_requires_evidence: nsfw->sfw reclassification is a gated act and must cite evidence"
-                        .to_string(),
-                );
+                return Err(String::from(McpRefusal::ReclassificationRequiresEvidence(
+                    "nsfw->sfw reclassification is a gated act and must cite evidence".to_string(),
+                )));
             }
             let stamp = parse_label_frontmatter(&content, repo.lane);
             let new_stamp = LabelStamp {
@@ -1196,10 +1260,11 @@ impl McpServer {
                 re_evidence,
                 body
             );
-            std::fs::write(&inbox_path, rewritten).map_err(|e| format!("write_failed: {}", e))?;
+            std::fs::write(&inbox_path, rewritten)
+                .map_err(|e| String::from(McpRefusal::WriteFailed(e.to_string())))?;
         }
-        let msg =
-            memory_promote(&repo.root, &file, &to).map_err(|e| format!("promote_failed: {}", e))?;
+        let msg = memory_promote(&repo.root, &file, &to)
+            .map_err(|e| String::from(McpRefusal::PromoteFailed(e.to_string())))?;
         let result = serde_json::json!({"promoted": msg, "repo": repo.name});
         let _ = self.rebuild();
         Ok(result)
@@ -1254,8 +1319,11 @@ impl McpServer {
     }
 
     fn tool_idea_lookup(&mut self, args: &serde_json::Value) -> ToolResult {
-        let query = arg_str(args, "query")
-            .ok_or_else(|| "invalid_params: missing required argument 'query'".to_string())?;
+        let query = arg_str(args, "query").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'query'".to_string(),
+            ))
+        })?;
         let q = query.to_ascii_lowercase();
         let found = self.index.ideas.iter().find(|i| {
             i.id.to_ascii_lowercase() == q
@@ -1277,19 +1345,26 @@ impl McpServer {
     fn tool_idea_register(&mut self, args: &serde_json::Value) -> ToolResult {
         let registrar = arg_str(args, "registrar").unwrap_or_default();
         if !matches!(registrar.to_ascii_lowercase().as_str(), "pax" | "owner") {
-            return Err(format!(
-                "registrar_not_gatekeeper: idea registration is a Pax/Owner gate act, got '{}'",
+            return Err(String::from(McpRefusal::RegistrarNotGatekeeper(format!(
+                "idea registration is a Pax/Owner gate act, got '{}'",
                 registrar
-            ));
+            ))));
         }
-        let ideas_path =
-            self.config.ideas_path.clone().ok_or_else(|| {
-                "ideas_not_configured: no idea register file configured".to_string()
-            })?;
-        let statement = arg_str(args, "statement")
-            .ok_or_else(|| "invalid_params: missing required argument 'statement'".to_string())?;
-        let home = arg_str(args, "home")
-            .ok_or_else(|| "invalid_params: missing required argument 'home'".to_string())?;
+        let ideas_path = self.config.ideas_path.clone().ok_or_else(|| {
+            String::from(McpRefusal::IdeasNotConfigured(
+                "no idea register file configured".to_string(),
+            ))
+        })?;
+        let statement = arg_str(args, "statement").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'statement'".to_string(),
+            ))
+        })?;
+        let home = arg_str(args, "home").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'home'".to_string(),
+            ))
+        })?;
         let aliases: Vec<String> = args
             .get("aliases")
             .and_then(|v| v.as_array())
@@ -1304,17 +1379,17 @@ impl McpServer {
                 if idea.aliases.iter().any(|x| x.eq_ignore_ascii_case(a))
                     || idea.statement.eq_ignore_ascii_case(a)
                 {
-                    return Err(format!(
-                        "suspected_duplicate: alias '{}' collides with {} ({})",
+                    return Err(String::from(McpRefusal::SuspectedDuplicate(format!(
+                        "alias '{}' collides with {} ({})",
                         a, idea.id, idea.statement
-                    ));
+                    ))));
                 }
             }
             if idea.statement.eq_ignore_ascii_case(&statement) {
-                return Err(format!(
-                    "suspected_duplicate: statement matches {} ({})",
+                return Err(String::from(McpRefusal::SuspectedDuplicate(format!(
+                    "statement matches {} ({})",
                     idea.id, idea.statement
-                ));
+                ))));
             }
         }
         let next = self
@@ -1339,24 +1414,27 @@ impl McpServer {
             .create(true)
             .append(true)
             .open(&ideas_path)
-            .map_err(|e| format!("write_failed: {}", e))?;
+            .map_err(|e| String::from(McpRefusal::WriteFailed(e.to_string())))?;
         use std::io::Write as _;
         fh.write_all(row.as_bytes())
-            .map_err(|e| format!("write_failed: {}", e))?;
+            .map_err(|e| String::from(McpRefusal::WriteFailed(e.to_string())))?;
         let result = serde_json::json!({"home": home, "id": id, "statement": statement});
         let _ = self.rebuild();
         Ok(result)
     }
 
     fn tool_lessons_search(&mut self, args: &serde_json::Value) -> ToolResult {
-        let query = arg_str(args, "query")
-            .ok_or_else(|| "invalid_params: missing required argument 'query'".to_string())?;
+        let query = arg_str(args, "query").ok_or_else(|| {
+            String::from(McpRefusal::InvalidParams(
+                "missing required argument 'query'".to_string(),
+            ))
+        })?;
         if query.chars().count() > SEARCH_QUERY_MAX {
-            return Err(format!(
-                "query_too_long: {} chars exceeds limit {}",
+            return Err(String::from(McpRefusal::QueryTooLong(format!(
+                "{} chars exceeds limit {}",
                 query.chars().count(),
                 SEARCH_QUERY_MAX
-            ));
+            ))));
         }
         let clearance = self.clearance_for(args);
         let tokens = query_tokens(&query);
@@ -1443,10 +1521,10 @@ impl McpServer {
 
     fn roadmap_json(&self, repo: &FleetRepo) -> ToolResult {
         let rollup = repo.roadmap.as_ref().ok_or_else(|| {
-            format!(
-                "roadmap_not_found: repo {} has no .ai/roadmap.md",
+            String::from(McpRefusal::RoadmapNotFound(format!(
+                "repo {} has no .ai/roadmap.md",
                 repo.name
-            )
+            )))
         })?;
         let phases: Vec<serde_json::Value> = rollup
             .phases
@@ -1485,7 +1563,9 @@ impl McpServer {
 
     fn tool_outcome_record(&mut self, args: &serde_json::Value) -> ToolResult {
         let path = self.config.outcomes_path.clone().ok_or_else(|| {
-            "outcomes_not_configured: no outcome store file configured".to_string()
+            String::from(McpRefusal::OutcomesNotConfigured(
+                "no outcome store file configured".to_string(),
+            ))
         })?;
         let mut intake = args.clone();
         if intake.is_object() && intake.get("recorded_at_epoch").is_none() {
@@ -1495,15 +1575,17 @@ impl McpServer {
         // inside from_intake_json; a refusal appends nothing.
         let record = OutcomeRecord::from_intake_json(&intake)?;
         append_outcome(&path, &record)?;
-        let mut stored =
-            serde_json::to_value(&record).map_err(|e| format!("invalid_outcome: {e}"))?;
+        let mut stored = serde_json::to_value(&record)
+            .map_err(|e| String::from(McpRefusal::InvalidOutcome(e.to_string())))?;
         stored["lesson_eligible"] = serde_json::json!(record.lesson_eligible());
         Ok(stored)
     }
 
     fn tool_outcome_list(&mut self, args: &serde_json::Value) -> ToolResult {
         let path = self.config.outcomes_path.clone().ok_or_else(|| {
-            "outcomes_not_configured: no outcome store file configured".to_string()
+            String::from(McpRefusal::OutcomesNotConfigured(
+                "no outcome store file configured".to_string(),
+            ))
         })?;
         let clearance = self.clearance_for(args);
         let server_filter = arg_str(args, "server");
@@ -1610,6 +1692,7 @@ fn evidence_resolves(root: &Path, evidence: &str) -> bool {
 /// server's state is file-backed and rebuildable.
 pub struct BlochHandler {
     server: Arc<Mutex<McpServer>>,
+    tools: std::result::Result<Vec<Tool>, String>,
 }
 
 impl BlochHandler {
@@ -1617,12 +1700,13 @@ impl BlochHandler {
     pub fn new(server: McpServer) -> BlochHandler {
         BlochHandler {
             server: Arc::new(Mutex::new(server)),
+            tools: rmcp_tools(),
         }
     }
 }
 
 /// The served tool surface as rmcp [`Tool`] values, converted from
-/// the hand-written definitions so the wire payload cannot drift
+/// the declared definitions so the wire payload cannot drift
 /// from [`tool_definitions`]. Conversion failure is a build-time
 /// class bug (the definitions are compiled in), surfaced as an
 /// internal error, never a silent drop.
@@ -1655,7 +1739,9 @@ impl ServerHandler for BlochHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, ErrorData> {
-        let tools = rmcp_tools()
+        let tools = self
+            .tools
+            .clone()
             .map_err(|e| ErrorData::internal_error(format!("internal_error: {e}"), None))?;
         Ok(ListToolsResult {
             tools,

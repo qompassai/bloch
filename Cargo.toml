@@ -22,6 +22,7 @@ name = "bloch"
 path = "src/main.rs"
 
 [dependencies]
+mcp-derive = { path = "/home/phaedrus/.GH/Qompass/mcp-derive" }
 tree-sitter = "0.25"
 tree-sitter-rust = "0.24"
 tree-sitter-lua = "0.2"

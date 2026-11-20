@@ -31,6 +31,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::roadmap::{ContentLabel, Lane};
+use crate::McpRefusal;
 
 /// Maximum bytes read back from one outcome store file.
 pub const OUTCOMES_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
@@ -230,37 +231,46 @@ impl OutcomeRecord {
     /// constructor share). Errors are typed strings (`kind: detail`).
     pub fn validate(&self) -> Result<(), String> {
         if self.outcome_id.trim().is_empty() {
-            return Err("invalid_outcome: outcome_id is empty".to_string());
+            return Err(String::from(McpRefusal::InvalidOutcome(
+                "outcome_id is empty".to_string(),
+            )));
         }
         if self.server.trim().is_empty() {
-            return Err("invalid_outcome: server is empty".to_string());
+            return Err(String::from(McpRefusal::InvalidOutcome(
+                "server is empty".to_string(),
+            )));
         }
         if self.asked.trim().is_empty() {
-            return Err("invalid_outcome: asked is empty".to_string());
+            return Err(String::from(McpRefusal::InvalidOutcome(
+                "asked is empty".to_string(),
+            )));
         }
         if self.asked.chars().count() > ASKED_MAX {
-            return Err(format!("invalid_outcome: asked exceeds {ASKED_MAX} chars"));
+            return Err(String::from(McpRefusal::InvalidOutcome(format!(
+                "asked exceeds {ASKED_MAX} chars"
+            ))));
         }
         if self.evidence.trim().is_empty() {
-            return Err(
-                "unlabelled_outcome: evidence is empty; a claimed label needs its evidence"
-                    .to_string(),
-            );
+            return Err(String::from(McpRefusal::UnlabelledOutcome(
+                "evidence is empty; a claimed label needs its evidence".to_string(),
+            )));
         }
         if self.produced.len() > PRODUCED_MAX {
-            return Err(format!(
-                "invalid_outcome: produced exceeds {PRODUCED_MAX} artifacts"
-            ));
+            return Err(String::from(McpRefusal::InvalidOutcome(format!(
+                "produced exceeds {PRODUCED_MAX} artifacts"
+            ))));
         }
         for artifact in &self.produced {
             if artifact.path.trim().is_empty() {
-                return Err("invalid_outcome: produced artifact with empty path".to_string());
+                return Err(String::from(McpRefusal::InvalidOutcome(
+                    "produced artifact with empty path".to_string(),
+                )));
             }
             if !is_sha256_hex(&artifact.sha256) {
-                return Err(format!(
-                    "invalid_outcome: artifact '{}' sha256 is not 64 lowercase hex chars",
+                return Err(String::from(McpRefusal::InvalidOutcome(format!(
+                    "artifact '{}' sha256 is not 64 lowercase hex chars",
                     artifact.path
-                ));
+                ))));
             }
         }
         Ok(())
@@ -275,42 +285,52 @@ impl OutcomeRecord {
     /// without a verification-strength label is refused), and a
     /// missing or unknown `result` refuses it as well (BL-3).
     pub fn from_intake_json(value: &serde_json::Value) -> Result<OutcomeRecord, String> {
-        let obj = value
-            .as_object()
-            .ok_or_else(|| "invalid_outcome: intake must be a JSON object".to_string())?;
+        let obj = value.as_object().ok_or_else(|| {
+            String::from(McpRefusal::InvalidOutcome(
+                "intake must be a JSON object".to_string(),
+            ))
+        })?;
         for field in ["origin_lane", "content_label", "evidence"] {
             match obj.get(field).and_then(|v| v.as_str()) {
                 Some(s) if !s.trim().is_empty() => {}
                 _ => {
-                    return Err(format!(
-                        "unlabelled_outcome: missing or empty '{field}'; \
+                    return Err(String::from(McpRefusal::UnlabelledOutcome(format!(
+                        "missing or empty '{field}'; \
                          records carry origin_lane + content_label + evidence from birth"
-                    ));
+                    ))));
                 }
             }
         }
         if Lane::parse(obj["origin_lane"].as_str().unwrap_or_default()).is_none() {
-            return Err("unlabelled_outcome: origin_lane is not general|restricted".to_string());
+            return Err(String::from(McpRefusal::UnlabelledOutcome(
+                "origin_lane is not general|restricted".to_string(),
+            )));
         }
         if ContentLabel::parse(obj["content_label"].as_str().unwrap_or_default()).is_none() {
-            return Err("unlabelled_outcome: content_label is not sfw|nsfw".to_string());
+            return Err(String::from(McpRefusal::UnlabelledOutcome(
+                "content_label is not sfw|nsfw".to_string(),
+            )));
         }
         match obj.get("verification").and_then(|v| v.as_str()) {
             Some(s) if VerificationStrength::parse(s).is_some() => {}
             _ => {
-                return Err("missing_verification: verification must be one of \
+                return Err(String::from(McpRefusal::MissingVerification(
+                    "verification must be one of \
                      self_reported|tool_checked|independently_cross_checked|owner_judged"
-                    .to_string());
+                        .to_string(),
+                )));
             }
         }
         match obj.get("result").and_then(|v| v.as_str()) {
             Some(s) if OutcomeResult::parse(s).is_some() => {}
             _ => {
-                return Err("missing_result: result must be one of ok|failed|abandoned".to_string());
+                return Err(String::from(McpRefusal::MissingResult(
+                    "result must be one of ok|failed|abandoned".to_string(),
+                )));
             }
         }
-        let record: OutcomeRecord =
-            serde_json::from_value(value.clone()).map_err(|e| format!("invalid_outcome: {e}"))?;
+        let record: OutcomeRecord = serde_json::from_value(value.clone())
+            .map_err(|e| String::from(McpRefusal::InvalidOutcome(e.to_string())))?;
         record.validate()?;
         Ok(record)
     }
@@ -330,18 +350,20 @@ pub fn append_outcome(path: &Path, record: &OutcomeRecord) -> Result<(), String>
     record.validate()?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("write_failed: {e}"))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| String::from(McpRefusal::WriteFailed(e.to_string())))?;
         }
     }
-    let line = serde_json::to_string(record).map_err(|e| format!("invalid_outcome: {e}"))?;
+    let line = serde_json::to_string(record)
+        .map_err(|e| String::from(McpRefusal::InvalidOutcome(e.to_string())))?;
     let mut fh = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .map_err(|e| format!("write_failed: {e}"))?;
+        .map_err(|e| String::from(McpRefusal::WriteFailed(e.to_string())))?;
     fh.write_all(line.as_bytes())
         .and_then(|()| fh.write_all(b"\n"))
-        .map_err(|e| format!("write_failed: {e}"))?;
+        .map_err(|e| String::from(McpRefusal::WriteFailed(e.to_string())))?;
     Ok(())
 }
 
@@ -353,14 +375,15 @@ pub fn read_outcomes(path: &Path) -> Result<Vec<OutcomeRecord>, String> {
     let meta = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("read_failed: {e}")),
+        Err(e) => return Err(String::from(McpRefusal::ReadFailed(e.to_string()))),
     };
     if meta.len() > OUTCOMES_FILE_MAX_BYTES {
-        return Err(format!(
-            "read_failed: outcome store exceeds {OUTCOMES_FILE_MAX_BYTES} bytes"
-        ));
+        return Err(String::from(McpRefusal::ReadFailed(format!(
+            "outcome store exceeds {OUTCOMES_FILE_MAX_BYTES} bytes"
+        ))));
     }
-    let text = std::fs::read_to_string(path).map_err(|e| format!("read_failed: {e}"))?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| String::from(McpRefusal::ReadFailed(e.to_string())))?;
     let mut out = Vec::new();
     for (idx, line) in text.lines().enumerate() {
         let t = line.trim();
@@ -368,12 +391,16 @@ pub fn read_outcomes(path: &Path) -> Result<Vec<OutcomeRecord>, String> {
             continue;
         }
         if out.len() >= OUTCOMES_MAX {
-            return Err(format!(
-                "read_failed: outcome store exceeds {OUTCOMES_MAX} records"
-            ));
+            return Err(String::from(McpRefusal::ReadFailed(format!(
+                "outcome store exceeds {OUTCOMES_MAX} records"
+            ))));
         }
-        let record: OutcomeRecord = serde_json::from_str(t)
-            .map_err(|e| format!("corrupt_outcome_store: line {}: {e}", idx + 1))?;
+        let record: OutcomeRecord = serde_json::from_str(t).map_err(|e| {
+            String::from(McpRefusal::CorruptOutcomeStore(format!(
+                "line {}: {e}",
+                idx + 1
+            )))
+        })?;
         out.push(record);
     }
     Ok(out)
